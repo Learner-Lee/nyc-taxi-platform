@@ -1,0 +1,4 @@
+data/raw/
+data/exports/
+notebooks/.ipynb_checkpoints/
+.DS_Store

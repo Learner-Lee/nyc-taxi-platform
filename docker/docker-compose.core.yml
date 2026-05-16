@@ -1,0 +1,219 @@
+x-spark-common: &spark-common
+  build:
+    context: ./spark
+    dockerfile: Dockerfile
+  env_file: .env
+  environment:
+    - SPARK_MODE=worker
+    - SPARK_MASTER_URL=spark://spark-master:7077
+    - SPARK_WORKER_MEMORY=${SPARK_WORKER_MEMORY}
+    - SPARK_WORKER_CORES=${SPARK_WORKER_CORES}
+    - SPARK_RPC_AUTHENTICATION_ENABLED=no
+    - SPARK_RPC_ENCRYPTION_ENABLED=no
+    - HADOOP_CONF_DIR=/opt/hadoop/conf
+  volumes:
+    - ../data:/data
+    - ../jobs:/jobs
+    - ./hadoop/core-site.xml:/opt/hadoop/conf/core-site.xml
+    - ./hadoop/hdfs-site.xml:/opt/hadoop/conf/hdfs-site.xml
+  depends_on:
+    - namenode
+
+networks:
+  taxi-net:
+    driver: bridge
+
+volumes:
+  namenode-data:
+  datanode1-data:
+  datanode2-data:
+  postgres-data:
+
+services:
+  namenode:
+    image: apache/hadoop:3.3.6
+    platform: linux/amd64
+    container_name: namenode
+    hostname: namenode
+    user: root
+    # 首次启动自动格式化，已格式化则直接启动
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        if [ ! -d /hadoop/dfs/name/current ]; then
+          echo ">>> First start: formatting NameNode..."
+          hdfs namenode -format -force -nonInteractive
+        fi
+        echo ">>> Starting NameNode..."
+        exec hdfs namenode
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    volumes:
+      - namenode-data:/hadoop/dfs/name
+      - ./hadoop/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
+      - ./hadoop/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml
+    networks:
+      - taxi-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9870 > /dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  datanode1:
+    image: apache/hadoop:3.3.6
+    platform: linux/amd64
+    container_name: datanode1
+    hostname: datanode1
+    user: root
+    command: ["hdfs", "datanode"]
+    volumes:
+      - datanode1-data:/hadoop/dfs/data
+      - ./hadoop/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
+      - ./hadoop/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml
+    depends_on:
+      namenode:
+        condition: service_healthy
+    networks:
+      - taxi-net
+
+  datanode2:
+    image: apache/hadoop:3.3.6
+    platform: linux/amd64
+    container_name: datanode2
+    hostname: datanode2
+    user: root
+    command: ["hdfs", "datanode"]
+    volumes:
+      - datanode2-data:/hadoop/dfs/data
+      - ./hadoop/core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
+      - ./hadoop/hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml
+    depends_on:
+      namenode:
+        condition: service_healthy
+    networks:
+      - taxi-net
+
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: spark-master
+    hostname: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - HADOOP_CONF_DIR=/opt/hadoop/conf
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ../data:/data
+      - ../jobs:/jobs
+      - ./hadoop/core-site.xml:/opt/hadoop/conf/core-site.xml
+      - ./hadoop/hdfs-site.xml:/opt/hadoop/conf/hdfs-site.xml
+    networks:
+      - taxi-net
+    healthcheck:
+      test: ["CMD-SHELL", "ps -ef | grep -v grep | grep -q 'org.apache.spark.deploy.master.Master' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  spark-worker-1:
+    <<: *spark-common
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    networks:
+      - taxi-net
+
+  spark-worker-2:
+    <<: *spark-common
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    networks:
+      - taxi-net
+
+  spark-worker-3:
+    <<: *spark-common
+    container_name: spark-worker-3
+    hostname: spark-worker-3
+    networks:
+      - taxi-net
+
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    hostname: postgres
+    env_file: .env
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      # 强制使用 md5 认证，兼容 Hive 3.1.3 自带的旧 PostgreSQL JDBC 驱动
+      - POSTGRES_HOST_AUTH_METHOD=md5
+      - POSTGRES_INITDB_ARGS=--auth-host=md5 --auth-local=md5
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - taxi-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taxi_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  hive-metastore:
+    image: apache/hive:3.1.3
+    platform: linux/amd64
+    container_name: hive-metastore
+    hostname: hive-metastore
+    environment:
+      - SERVICE_NAME=metastore
+      - DB_DRIVER=postgres
+      - SERVICE_OPTS=-Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/hive_metastore -Djavax.jdo.option.ConnectionUserName=taxi_user -Djavax.jdo.option.ConnectionPassword=taxi_pass123
+    ports:
+      - "9083:9083"
+    volumes:
+      - ./hadoop/core-site.xml:/opt/hadoop/conf/core-site.xml
+      - ./hadoop/hdfs-site.xml:/opt/hadoop/conf/hdfs-site.xml
+    depends_on:
+      postgres:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+    networks:
+      - taxi-net
+
+  jupyter:
+    image: jupyter/pyspark-notebook:spark-3.4.1
+    container_name: jupyter
+    hostname: jupyter
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=
+      - PYSPARK_PYTHON=python3
+      - HADOOP_CONF_DIR=/opt/hadoop/conf
+    ports:
+      - "8888:8888"
+    volumes:
+      - ../notebooks:/home/jovyan/work/notebooks
+      - ../jobs:/home/jovyan/work/jobs
+      - ../data:/home/jovyan/work/data
+      - ./hadoop/core-site.xml:/opt/hadoop/conf/core-site.xml
+      - ./hadoop/hdfs-site.xml:/opt/hadoop/conf/hdfs-site.xml
+      - ./spark/spark-defaults.conf:/usr/local/spark/conf/spark-defaults.conf
+    depends_on:
+      - spark-master
+      - namenode
+    networks:
+      - taxi-net

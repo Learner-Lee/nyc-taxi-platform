@@ -1,0 +1,6 @@
+<clickhouse>
+    <!-- 内存限制：最多使用 4GB（STAGE 09 调整）-->
+    <max_server_memory_usage_to_ram_ratio>0.5</max_server_memory_usage_to_ram_ratio>
+    <!-- 允许来自任意 IP 的连接 -->
+    <listen_host>0.0.0.0</listen_host>
+</clickhouse>
