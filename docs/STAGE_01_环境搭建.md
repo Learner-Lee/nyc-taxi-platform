@@ -106,34 +106,28 @@ jupyter             Up 2 minutes
 
 ### 步骤 3：初始化 HDFS 目录结构
 
-**🤔 为什么这么做**：在新文件系统上建好规范目录，后续各层数据各归其位。
+**🤔 为什么这么做**：在新文件系统上建好规范目录，后续各层数据各归其位。**特别注意 `/spark-logs`**——这是 Spark History Server 写事件日志的位置，不建会导致 SparkContext 启动报 `FileNotFoundException`。
 
-**⌨️ 操作**：
+**⌨️ 操作**（从 Mac 终端一行执行，不用进交互式 shell）：
 ```bash
-docker exec -it namenode bash
-
-hdfs dfs -mkdir -p /nyc-taxi/raw
-hdfs dfs -mkdir -p /nyc-taxi/ods
-hdfs dfs -mkdir -p /nyc-taxi/dwd
-hdfs dfs -mkdir -p /nyc-taxi/dws
-hdfs dfs -mkdir -p /nyc-taxi/ads
-hdfs dfs -mkdir -p /user/hive/warehouse
-hdfs dfs -chmod -R 777 /nyc-taxi
-hdfs dfs -chmod -R 777 /user/hive/warehouse
+docker exec namenode bash -c "
+hdfs dfs -mkdir -p /nyc-taxi/raw /nyc-taxi/ods /nyc-taxi/dwd /nyc-taxi/dws /nyc-taxi/ads /spark-logs /user/hive/warehouse && \
+hdfs dfs -chmod -R 777 /nyc-taxi /spark-logs /user/hive/warehouse && \
 hdfs dfs -ls /
-
-exit
+"
 ```
 
 **✅ 预期效果**：
 ```
-Found 2 items
+Found 3 items
 drwxrwxrwx   - root supergroup  0 ... /nyc-taxi
+drwxrwxrwx   - root supergroup  0 ... /spark-logs
 drwxrwxrwx   - root supergroup  0 ... /user
 ```
 
 **🐛 如果出错**：
-- `Safe mode` → 运行 `hdfs dfsadmin -safemode leave`，HDFS 刚启动时处于保护模式
+- `Safe mode` → 运行 `docker exec namenode hdfs dfsadmin -safemode leave`，HDFS 刚启动时处于保护模式
+- 后续 Spark 报 `File does not exist: hdfs://namenode:9000/spark-logs` → 这一步漏建 `/spark-logs` 目录
 
 ---
 
@@ -161,30 +155,44 @@ for w in workers:
 
 **🤔 为什么这么做**：验证完整链路——Jupyter → Spark → HDFS，都通才算 STAGE 01 真正完成。
 
-**⌨️ 操作**：浏览器打开 `http://localhost:8888`，新建 Python 3 Notebook，粘贴执行：
+**⚠️ 关键陷阱**：必须在 **Jupyter 的浏览器 Web UI** 里跑，**不能**在 Mac 的终端里跑 Python！
+- `spark-master`、`namenode` 这些 hostname **只在 Docker 内部网络可解析**
+- Mac 本机的 Python 进程不在那个网络里，会报 `UnknownHostException: spark-master`
+- 只有 Jupyter 容器在 `taxi-net` 网络里，才能用 hostname 通信
 
-```python
-from pyspark.sql import SparkSession
+**⌨️ 操作**：
+1. Mac 浏览器打开 `http://localhost:8888`
+2. 在 JupyterLab 界面点 **Python 3 (ipykernel)** 新建 Notebook
+3. **先在第一个 cell 验证环境**（确认在容器里）：
+   ```python
+   import socket
+   print("当前 hostname:", socket.gethostname())
+   # 应该看到: 当前 hostname: jupyter
+   # 如果看到 AlensdeMacBook 等本机 hostname，说明没在 Jupyter UI 里跑
+   ```
+4. 在第二个 cell 跑端到端验证：
+   ```python
+   from pyspark.sql import SparkSession
 
-spark = SparkSession.builder \
-    .appName("STAGE01-验证") \
-    .master("spark://spark-master:7077") \
-    .config("spark.executor.memory", "2g") \
-    .getOrCreate()
+   spark = SparkSession.builder \
+       .appName("STAGE01-验证") \
+       .master("spark://spark-master:7077") \
+       .config("spark.executor.memory", "2g") \
+       .getOrCreate()
 
-df = spark.createDataFrame(
-    [("NYC Cab Co.", 2024, "Ready to go!")],
-    ["company", "year", "status"]
-)
-df.write.mode("overwrite").parquet("hdfs://namenode:9000/nyc-taxi/raw/test")
+   df = spark.createDataFrame(
+       [("NYC Cab Co.", 2024, "Ready to go!")],
+       ["company", "year", "status"]
+   )
+   df.write.mode("overwrite").parquet("hdfs://namenode:9000/nyc-taxi/raw/test")
 
-df2 = spark.read.parquet("hdfs://namenode:9000/nyc-taxi/raw/test")
-df2.show()
+   df2 = spark.read.parquet("hdfs://namenode:9000/nyc-taxi/raw/test")
+   df2.show()
 
-print(f"Spark 版本: {spark.version}")
-print("✅ STAGE 01 验证通过！")
-spark.stop()
-```
+   print(f"Spark 版本: {spark.version}")
+   print("✅ STAGE 01 验证通过！")
+   spark.stop()
+   ```
 
 **✅ 预期效果**：
 ```
@@ -193,13 +201,15 @@ spark.stop()
 +------------+----+------------+
 |NYC Cab Co. |2024|Ready to go!|
 +------------+----+------------+
-Spark 版本: 3.4.x
+Spark 版本: 3.4.1
 ✅ STAGE 01 验证通过！
 ```
 
 **🐛 如果出错**：
+- `UnknownHostException: spark-master` → 你跑在了 Mac 终端，请去浏览器打开 Jupyter Web UI
+- `File does not exist: hdfs://namenode:9000/spark-logs` → 步骤 3 漏建目录，回去补一下
 - `Connection to spark-master:7077 refused` → Spark Master 没启动，检查 `docker ps`
-- OOM 报错 → 把 `executor.memory` 从 `2g` 改为 `1g` 重试
+- 上次 `getOrCreate()` 失败后再跑直接报错 → **Kernel → Restart Kernel** 清空 SparkContext 再试
 
 ---
 
@@ -257,11 +267,70 @@ exit
 
 ---
 
+## 🛑 踩坑实录（真实搭建过程中遇到的 5 个问题）
+
+> 这些都是企业级项目里常见的「跨平台/版本兼容性」问题，**理解这些坑就是面试加分项**
+
+### 坑 1：bitnami/spark 镜像在 Docker Hub 下架
+**现象**：`docker pull bitnami/spark:3.4.1` 报 `not found`
+**根因**：Bitnami 被 Broadcom 收购后调整了镜像分发策略，老镜像仓库被迁移到 `bitnamilegacy/`
+**修复**：Dockerfile 改用 `FROM bitnamilegacy/spark:3.4.1`
+**面试可讲**:供应链风险——生产环境镜像必须 mirror 到内部 registry，不能直接依赖公共仓库
+
+### 坑 2:Apple Silicon Mac 跑 amd64-only 镜像
+**现象**:启动时警告 `platform (linux/amd64) does not match host (linux/arm64/v8)`
+**根因**:`apache/hadoop:3.3.6`、`apache/hive:3.1.3` 只发布了 amd64 版本，没有 ARM64 原生构建
+**修复**:在 compose 文件对应服务加 `platform: linux/amd64`,通过 Rosetta 模拟运行
+**面试可讲**:M 系列 Mac 跑生产组件的常见适配方式;真实生产环境应该用 ARM64 原生镜像或者多架构 manifest
+
+### 坑 3:apache/hadoop NameNode 首次启动不自动格式化
+**现象**:`InconsistentFSStateException: Directory /hadoop/dfs/name is in an inconsistent state`
+**根因**:Hadoop 官方镜像不像 bde2020/hadoop 那样自动 format,需要手动 `hdfs namenode -format`
+**修复**:用 bash 脚本检测 `current/` 目录,首次启动自动 format
+```yaml
+command:
+  - /bin/bash
+  - -c
+  - |
+    if [ ! -d /hadoop/dfs/name/current ]; then
+      hdfs namenode -format -force -nonInteractive
+    fi
+    exec hdfs namenode
+```
+**面试可讲**:HDFS 元数据结构(fsimage + edits log),格式化做了什么(初始化 clusterId/blockPoolId)
+
+### 坑 4:PostgreSQL 15 与 Hive 3.1.3 自带 JDBC 驱动认证不兼容
+**现象**:`PSQLException: The authentication type 10 is not supported`
+**根因**:PostgreSQL 15 默认 `scram-sha-256` 认证(协议代码 10),Hive 3.1.3 自带的 PostgreSQL JDBC 驱动(版本太老)只支持 md5
+**修复**:在 postgres 服务环境变量强制使用 md5:
+```yaml
+environment:
+  - POSTGRES_HOST_AUTH_METHOD=md5
+  - POSTGRES_INITDB_ARGS=--auth-host=md5 --auth-local=md5
+```
+**面试可讲**:数据库认证演进(md5 → scram-sha-256 安全性提升);组件版本组合(Hive 3.1 适配 PG ≤13,新版需要升级 hive-metastore 或单独 mount 新驱动)
+**注意**:authMethod 在 initdb 时确定,改完必须 `down -v` 清空数据卷才生效
+
+### 坑 5:bitnami 精简镜像里 curl 不可用导致 healthcheck 误报
+**现象**:容器实际功能正常但状态显示 unhealthy
+**根因**:Bitnami legacy spark 镜像里 curl 不在 PATH 中,导致 healthcheck 脚本失败
+**修复**:健康检查不依赖外部命令,改用 ps 探测 JVM 进程:
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "ps -ef | grep -v grep | grep -q 'org.apache.spark.deploy.master.Master' || exit 1"]
+```
+**面试可讲**:容器健康检查的几种方式对比(HTTP 探测 vs TCP 探测 vs 进程探测),进程探测最通用但不能反映服务真实可用性
+
+### 复盘:为什么这些坑值得记录?
+本项目是「学习+面试」双目标,这些坑不是浪费时间,而是**真实生产环境中常见的工程问题**。能讲清楚根因和修复方案,比单纯说"我搭过 Spark 集群"含金量高得多。
+
+---
+
 ## 🧹 阶段收尾
 
-- **保持 core 组运行**（STAGE 02 继续需要）
-- 清理测试数据：`docker exec namenode hdfs dfs -rm -r /nyc-taxi/raw/test`
-- 建议提交一次 git：`git add docker/ && git commit -m "feat: STAGE01 core 组环境搭建完成"`
+- **保持 core 组运行**(STAGE 02 继续需要)
+- 清理测试数据:`docker exec namenode hdfs dfs -rm -r /nyc-taxi/raw/test`
+- 建议提交一次 git:`git init && git add . && git commit -m "feat: STAGE01 环境搭建完成,踩 5 坑后稳定运行"`
 
 ---
 
