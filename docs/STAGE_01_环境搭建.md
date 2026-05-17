@@ -321,6 +321,25 @@ healthcheck:
 ```
 **面试可讲**:容器健康检查的几种方式对比(HTTP 探测 vs TCP 探测 vs 进程探测),进程探测最通用但不能反映服务真实可用性
 
+### 坑 6:apache/hive:3.1.3 入口脚本硬编码 `SKIP_SCHEMA_INIT=false`,每次重启都尝试初始化 schema 报错退出
+**现象**:第二次启动 hive-metastore 后,容器 Exit (1),日志显示 `ERROR: relation "BUCKETING_COLS" already exists`
+**根因**:`apache/hive:3.1.3` 镜像的 `/entrypoint.sh` 里写死了 `SKIP_SCHEMA_INIT=false`,**忽略外部传入的同名环境变量**——无论你 docker-compose 里怎么设,脚本都会跑 `schemaTool -initSchema`,而 PostgreSQL 里已经初始化过 schema 了,自然 `relation already exists` 退出。
+**修复**:直接 override entrypoint,绕过 entrypoint.sh,自己启动 metastore 服务:
+```yaml
+hive-metastore:
+  image: apache/hive:3.1.3
+  environment:
+    # hive --service metastore 会读 HADOOP_CLIENT_OPTS 获取 JDBC 配置
+    - HADOOP_CLIENT_OPTS=-Xmx1G -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/hive_metastore -Djavax.jdo.option.ConnectionUserName=taxi_user -Djavax.jdo.option.ConnectionPassword=taxi_pass123
+  entrypoint: ["/opt/hive/bin/hive", "--service", "metastore"]
+```
+**诊断过程值得讲**:
+1. 看 logs 报错 → 加 `SKIP_SCHEMA_INIT=true` 环境变量
+2. 重启后仍然报错 → `docker inspect` 确认环境变量进了容器
+3. 翻 entrypoint.sh 的 set -x 输出,发现 `+ SKIP_SCHEMA_INIT=false`(硬赋值,非默认值语法 `:-`)
+4. 确认镜像 bug 不可绕过,直接 override entrypoint
+**面试可讲**:Docker 镜像设计反模式——不应该硬编码"应该可配置"的变量;以及 entrypoint vs CMD 的关系(用 entrypoint 完全绕过镜像默认入口)
+
 ### 复盘:为什么这些坑值得记录?
 本项目是「学习+面试」双目标,这些坑不是浪费时间,而是**真实生产环境中常见的工程问题**。能讲清楚根因和修复方案,比单纯说"我搭过 Spark 集群"含金量高得多。
 

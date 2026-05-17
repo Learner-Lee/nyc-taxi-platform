@@ -212,10 +212,12 @@ flowchart LR
 • 通过 Airflow 构建 13 个 DAG 任务的自动化 ETL Pipeline，
   支持失败重试和邮件告警，日均调度稳定运行
 
-• 工程化能力：独立诊断并解决 5 类跨平台/版本兼容性问题
+• 工程化能力：独立诊断并解决 8 类跨平台/版本兼容性与数据契约问题
   （ARM64 与 amd64 镜像适配、PostgreSQL 15 与旧 JDBC 驱动 SCRAM/MD5 认证冲突、
   Hadoop NameNode 首次启动自动格式化、精简镜像下的健康检查重设计、
-  上游镜像仓库迁移应急切换），保障开发环境与生产架构拓扑一致
+  上游镜像仓库迁移应急切换、Hive 入口脚本硬编码 bug 的 entrypoint override、
+  维表 CSV 解析的 ODS Parquet 转换最佳实践、上游 Parquet schema 隐式变更监控），
+  保障开发环境与生产架构拓扑一致,沉淀完整《踩坑实录》文档
 ```
 
 ---

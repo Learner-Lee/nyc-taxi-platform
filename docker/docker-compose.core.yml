@@ -180,7 +180,11 @@ services:
     environment:
       - SERVICE_NAME=metastore
       - DB_DRIVER=postgres
-      - SERVICE_OPTS=-Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/hive_metastore -Djavax.jdo.option.ConnectionUserName=taxi_user -Djavax.jdo.option.ConnectionPassword=taxi_pass123
+      # 直接通过 HADOOP_CLIENT_OPTS 传 JDBC 连接信息(hive --service metastore 会读取这个变量)
+      - HADOOP_CLIENT_OPTS=-Xmx1G -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/hive_metastore -Djavax.jdo.option.ConnectionUserName=taxi_user -Djavax.jdo.option.ConnectionPassword=taxi_pass123
+    # Override entrypoint.sh 绕过其硬编码的 initSchema 逻辑
+    # (该 entrypoint.sh 里写死了 SKIP_SCHEMA_INIT=false,导致每次重启都重新初始化 schema 报错退出)
+    entrypoint: ["/opt/hive/bin/hive", "--service", "metastore"]
     ports:
       - "9083:9083"
     volumes:

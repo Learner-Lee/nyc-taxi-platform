@@ -7,7 +7,8 @@
 - [项目总览](docs/PROJECT_OVERVIEW.md) — 架构图、业务背景、简历/面试价值
 - [资源规划](docs/RESOURCE_PLAN.md) — 内存预算、分组启停、OOM 应急
 - [学习路径](docs/LEARNING_PATH.md) — 阶段依赖、核心概念、延伸阅读
-- [STAGE 01](docs/STAGE_01_环境搭建.md) — 环境搭建与 HDFS 入门（含 5 个踩坑实录）
+- [STAGE 01](docs/STAGE_01_环境搭建.md) — 环境搭建与 HDFS 入门（含 6 个踩坑实录）
+- [STAGE 02](docs/STAGE_02_数据接入与ODS层.md) — 数据接入与 ODS 层（含 2 个踩坑实录 + CSV vs Parquet 对比实验）
 
 ## 启动
 
@@ -31,8 +32,8 @@ docker compose -f docker/docker-compose.serving.yml up -d
 ## 当前进度
 
 - [x] **STAGE 00**: 文档体系搭建（PROJECT_OVERVIEW / RESOURCE_PLAN / LEARNING_PATH）
-- [x] **STAGE 01**: 环境搭建与 HDFS 入门 — 10 容器健康运行，踩 5 坑后稳定
-- [ ] STAGE 02: 数据接入与 ODS 层
+- [x] **STAGE 01**: 环境搭建与 HDFS 入门 — 10 容器健康运行，踩 6 坑后稳定
+- [~] **STAGE 02** (进行中): 数据接入与 ODS 层 — 955 万行入库，踩 2 坑（CSV 解析、上游 schema 变更），CSV vs Parquet 对比实验进行中
 - [ ] STAGE 03: 存储层优化
 - [ ] STAGE 04: DWD 层与数据清洗
 - [ ] STAGE 05: 计算层优化
