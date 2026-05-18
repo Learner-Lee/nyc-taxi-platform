@@ -9,6 +9,8 @@
 - [学习路径](docs/LEARNING_PATH.md) — 阶段依赖、核心概念、延伸阅读
 - [STAGE 01](docs/STAGE_01_环境搭建.md) — 环境搭建与 HDFS 入门（含 6 个踩坑实录）
 - [STAGE 02](docs/STAGE_02_数据接入与ODS层.md) — 数据接入与 ODS 层（含 2 个踩坑实录 + CSV vs Parquet 对比实验）
+- [STAGE 03](docs/STAGE_03_存储层优化.md) — 存储层优化（Zstd / 分区裁剪 / 小文件治理 三项量化实验）
+- [STAGE 04](docs/STAGE_04_DWD层与数据清洗.md) — DWD 层与数据清洗（96.57% 可信率 + Broadcast Join 3.75x 加速 + 业务洞察）
 
 ## 启动
 
@@ -33,9 +35,9 @@ docker compose -f docker/docker-compose.serving.yml up -d
 
 - [x] **STAGE 00**: 文档体系搭建（PROJECT_OVERVIEW / RESOURCE_PLAN / LEARNING_PATH）
 - [x] **STAGE 01**: 环境搭建与 HDFS 入门 — 10 容器健康运行，踩 6 坑后稳定
-- [~] **STAGE 02** (进行中): 数据接入与 ODS 层 — 955 万行入库，踩 2 坑（CSV 解析、上游 schema 变更），CSV vs Parquet 对比实验进行中
-- [ ] STAGE 03: 存储层优化
-- [ ] STAGE 04: DWD 层与数据清洗
+- [x] **STAGE 02**: 数据接入与 ODS 层 — 955 万行入库，踩 2 坑（CSV 解析、上游 schema 变更），CSV vs Parquet 实验完成（**12.2x 加速 / 5.3x 压缩**）
+- [x] **STAGE 03**: 存储层优化 — 三项实验完成:**Zstd 全面胜出**(24% 空间节省 + 42% 读取加速)、**分区裁剪 2.77x 加速**、**小文件治理 20.3x 加速 + 15.6% 存储节省**
+- [x] **STAGE 04**: DWD 层与数据清洗 — 9.55M→9.23M (**96.57% 可信率**) + 11 业务衍生字段 + **Broadcast Join 3.75x 加速** + 业务洞察(早高峰仅晚高峰 53% / 机场客单价 3.5x)
 - [ ] STAGE 05: 计算层优化
 - [ ] STAGE 06: 数据倾斜实战
 - [ ] STAGE 07: DWS 层与查询优化
