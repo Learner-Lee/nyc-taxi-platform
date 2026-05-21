@@ -72,6 +72,7 @@ docker compose -f docker/docker-compose.core.yml ps
 **🤔 为什么这么做**：第一次启动会拉取镜像（约 5-8GB），需要耐心等待。
 
 **⌨️ 操作**：
+
 ```bash
 cd /storage/Study_file/NYC-Taxi-Trip-analysis/nyc-taxi-platform
 
@@ -156,14 +157,17 @@ for w in workers:
 **🤔 为什么这么做**：验证完整链路——Jupyter → Spark → HDFS，都通才算 STAGE 01 真正完成。
 
 **⚠️ 关键陷阱**：必须在 **Jupyter 的浏览器 Web UI** 里跑，**不能**在 Mac 的终端里跑 Python！
+
 - `spark-master`、`namenode` 这些 hostname **只在 Docker 内部网络可解析**
 - Mac 本机的 Python 进程不在那个网络里，会报 `UnknownHostException: spark-master`
 - 只有 Jupyter 容器在 `taxi-net` 网络里，才能用 hostname 通信
 
 **⌨️ 操作**：
+
 1. Mac 浏览器打开 `http://localhost:8888`
 2. 在 JupyterLab 界面点 **Python 3 (ipykernel)** 新建 Notebook
 3. **先在第一个 cell 验证环境**（确认在容器里）：
+   
    ```python
    import socket
    print("当前 hostname:", socket.gethostname())
@@ -173,22 +177,22 @@ for w in workers:
 4. 在第二个 cell 跑端到端验证：
    ```python
    from pyspark.sql import SparkSession
-
+   
    spark = SparkSession.builder \
        .appName("STAGE01-验证") \
        .master("spark://spark-master:7077") \
        .config("spark.executor.memory", "2g") \
        .getOrCreate()
-
+   
    df = spark.createDataFrame(
        [("NYC Cab Co.", 2024, "Ready to go!")],
        ["company", "year", "status"]
    )
    df.write.mode("overwrite").parquet("hdfs://namenode:9000/nyc-taxi/raw/test")
-
+   
    df2 = spark.read.parquet("hdfs://namenode:9000/nyc-taxi/raw/test")
    df2.show()
-
+   
    print(f"Spark 版本: {spark.version}")
    print("✅ STAGE 01 验证通过！")
    spark.stop()
@@ -232,7 +236,15 @@ hdfs dfs -put /tmp/test_300mb.bin /nyc-taxi/raw/
 hdfs fsck /nyc-taxi/raw/test_300mb.bin -files -blocks -locations
 ```
 
+```ini
+docker exec → 进入 HDFS 主节点
+dd → 生成 300MB 测试文件
+hdfs dfs -put → 上传到 HDFS
+hdfs fsck → 查看文件如何分块存储
+```
+
 **👀 观察重点**：
+
 1. 300MB 文件被切成几块？（128MB 一块，应该是 3 块）
 2. 每块有几个副本？（默认 3 个，但我们只有 2 个 DataNode，所以是 2 个）
 3. 块分布在哪些 DataNode 上？

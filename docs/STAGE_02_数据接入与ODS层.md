@@ -45,6 +45,7 @@ docker compose -f docker/docker-compose.core.yml ps
 
 ### 概念 1:为什么有 ODS 层?
 **业务类比**:超市进货时,先把厂家发来的货原封不动放进"待检区",检查无误后再上架。ODS(Operational Data Store) 就是数据平台的"待检区",**原样保留**外部数据,**不做任何业务转换**。这样做的好处:
+
 - 出问题能追溯到最原始的数据
 - 后续 DWD 层规则改了,可以从 ODS 重跑,不用重新下载
 - 上下游解耦——上游数据格式变了只影响 ODS
@@ -57,6 +58,7 @@ docker compose -f docker/docker-compose.core.yml ps
 ### 概念 3:列式存储(Parquet)的核心优势
 **业务类比**:CSV 像一本流水账日记(每页一行,要看"3 月所有上车地点"必须翻完所有日记);Parquet 像一本"按列分卷的账本"(地点单独一卷,需要时只翻地点卷)。
 **两个关键优势**:
+
 1. **列裁剪**(Column Pruning):SELECT 一列就只读一列
 2. **谓词下推**(Predicate Pushdown):Parquet 文件头记录了每个 row group 的 min/max,WHERE 条件可以跳过整段不读
 
@@ -164,9 +166,9 @@ from pyspark.sql import SparkSession
 spark = SparkSession.builder \
     .appName("STAGE02-ODS-DDL") \
     .master("spark://spark-master:7077") \
-    .config("spark.sql.warehouse.dir", "hdfs://namenode:9000/user/hive/warehouse") \
-    .config("hive.metastore.uris", "thrift://hive-metastore:9083") \
-    .enableHiveSupport() \
+    .config("spark.sql.warehouse.dir", "hdfs://namenode:9000/user/hive/warehouse") \ # 配置 Hive 数据仓库在 HDFS 上的存储路径
+    .config("hive.metastore.uris", "thrift://hive-metastore:9083") \ # 连接 Hive 元数据服务, 不连这个，Spark 就找不到任何 Hive 表
+    .enableHiveSupport() \ # 开启 Hive 支持
     .getOrCreate()
 
 # 创建 ods 数据库
@@ -179,9 +181,9 @@ CREATE EXTERNAL TABLE ods.yellow_trips (
     VendorID INT,
     tpep_pickup_datetime TIMESTAMP,
     tpep_dropoff_datetime TIMESTAMP,
-    passenger_count BIGINT,       -- NYC TLC 2024 schema 是 INT64,不是 DOUBLE(详见踩坑实录坑 8)
+    passenger_count BIGINT,       
     trip_distance DOUBLE,
-    RatecodeID BIGINT,            -- 同上,2024 schema 改成 INT64 了
+    RatecodeID BIGINT,            
     store_and_fwd_flag STRING,
     PULocationID INT,
     DOLocationID INT,
@@ -196,8 +198,8 @@ CREATE EXTERNAL TABLE ods.yellow_trips (
     congestion_surcharge DOUBLE,
     Airport_fee DOUBLE
 )
-PARTITIONED BY (year INT, month INT)
-STORED AS PARQUET
+PARTITIONED BY (year INT, month INT)  -- 分区
+STORED AS PARQUET                     -- 存储格式
 LOCATION 'hdfs://namenode:9000/nyc-taxi/ods/yellow_trips'
 """)
 
@@ -209,14 +211,32 @@ spark.sql("ALTER TABLE ods.yellow_trips ADD IF NOT EXISTS PARTITION (year=2024, 
 # 维表:CSV 原始文件用 Spark 直读 → 转 Parquet → 注册外部 Parquet 表
 # (CSV 用 Hive ROW FORMAT 解析有"双坑":skip.header 经常失效 + 不处理 quote,详见踩坑实录坑 7)
 from pyspark.sql.functions import col
-df_zone = spark.read \
-    .option("header", "true") \
-    .option("quote", '"') \
-    .option("escape", '"') \
-    .csv("hdfs://namenode:9000/nyc-taxi/ods/taxi_zone_lookup/taxi_zone_lookup.csv")
-df_zone = df_zone.withColumn("LocationID", col("LocationID").cast("int"))
-df_zone.write.mode("overwrite").parquet("hdfs://namenode:9000/nyc-taxi/ods/taxi_zone_lookup_parquet")
 
+# 1. 用 Spark 直读 CSV(正确处理 header + quote)
+df_zone = spark.read \
+    .option("header", "true") \ # 第一行是表头（列名）
+    .option("quote", '"') \ 
+    .option("escape", '"') \ 
+    .csv("hdfs://namenode:9000/nyc-taxi/ods/taxi_zone_lookup/taxi_zone_lookup.csv")
+# 带表头
+# 字段用双引号包裹
+# 字段内部可能有逗号
+# 字段内部可能有双引号
+    
+# 2. 类型转换(LocationID 从 STRING 转 INT)
+df_zone = df_zone.withColumn("LocationID", col("LocationID").cast("int"))
+
+print("=== 预览原始数据(已正确解析)===")
+df_zone.show(5, truncate=False)
+df_zone.printSchema()
+print(f"维表总行数: {df_zone.count()}")
+
+# 3. 写成 Parquet 到独立路径(原 CSV 文件依然保留,做"溯源备份")
+df_zone.write.mode("overwrite").parquet(
+    "hdfs://namenode:9000/nyc-taxi/ods/taxi_zone_lookup_parquet"
+)
+
+# 4. 重建外部表,指向 Parquet
 spark.sql("DROP TABLE IF EXISTS ods.taxi_zone_lookup")
 spark.sql("""
 CREATE EXTERNAL TABLE ods.taxi_zone_lookup (
@@ -229,10 +249,9 @@ STORED AS PARQUET
 LOCATION 'hdfs://namenode:9000/nyc-taxi/ods/taxi_zone_lookup_parquet'
 """)
 
-print("✅ 表已注册,验证:")
-spark.sql("SHOW TABLES IN ods").show()
-spark.sql("SHOW PARTITIONS ods.yellow_trips").show()
+print("\n=== 重建后的维表(Parquet)===")
 spark.sql("SELECT * FROM ods.taxi_zone_lookup LIMIT 5").show()
+print(f"总行数: {spark.sql('SELECT COUNT(*) FROM ods.taxi_zone_lookup').collect()[0][0]}")
 ```
 
 **✅ 预期效果**:看到两张表 + 3 个分区 + 维表前 5 行(`1 | EWR | Newark Airport | EWR`)
@@ -311,34 +330,46 @@ spark.sql("""
 ```python
 import time
 
-# 读 2024-01 Parquet (原始)
+# 读 2024-01 这一个分区(原始 Parquet,约 296 万行)
 df_jan = spark.read.parquet("hdfs://namenode:9000/nyc-taxi/ods/yellow_trips/year=2024/month=01")
-df_jan.cache().count()  # 触发缓存,避免后续受 cold start 影响
+n = df_jan.count()
+print(f"基准数据行数: {n:,}")
 
-# 写一份 CSV 用于对比
+# 写一份 CSV(用于对比)
 csv_path = "hdfs://namenode:9000/nyc-taxi/ods/_benchmark/yellow_2024_01_csv"
+print("\n正在写 CSV...")
+t0 = time.time()
 df_jan.write.mode("overwrite").option("header", "true").csv(csv_path)
+print(f"CSV 写入耗时: {time.time() - t0:.1f}s")
 
-# 把同样的数据再写一份 Parquet 到对比目录(保证读取条件一致)
+# 同一份数据再写一份 Parquet(保证读取条件完全一致)
 parquet_path = "hdfs://namenode:9000/nyc-taxi/ods/_benchmark/yellow_2024_01_parquet"
+print("\n正在写 Parquet...")
+t0 = time.time()
 df_jan.write.mode("overwrite").parquet(parquet_path)
+print(f"Parquet 写入耗时: {time.time() - t0:.1f}s")
 
-print("✅ 两种格式准备就绪")
+print("\n✅ 两种格式数据准备就绪")
+```
+
+```
+基准数据行数: 2,964,624
+
+正在写 CSV...
+CSV 写入耗时: 2.8s
+
+正在写 Parquet...
+Parquet 写入耗时: 2.1s
+
+✅ 两种格式数据准备就绪
 ```
 
 **第 2 步:对比文件体积**
 
 ```python
-import subprocess
-def hdfs_size(path):
-    out = subprocess.check_output(
-        ["docker", "exec", "namenode", "hdfs", "dfs", "-du", "-s", "-h", path]
-    ).decode().split()
-    return out[0] + " " + out[1]
-
-# 注意:这一行需要从 Jupyter 内部执行 docker 命令,jupyter 容器里没有 docker CLI
-# 替代方案:直接读 HDFS API
+# 用 Spark JVM 桥读 HDFS 上的文件实际大小
 fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+
 
 def hdfs_size_bytes(path):
     total = 0
@@ -347,12 +378,26 @@ def hdfs_size_bytes(path):
         total += files.next().getLen()
     return total
 
+
 csv_bytes = hdfs_size_bytes(csv_path)
 parquet_bytes = hdfs_size_bytes(parquet_path)
 
-print(f"CSV     大小: {csv_bytes / 1024 / 1024:,.1f} MB")
-print(f"Parquet 大小: {parquet_bytes / 1024 / 1024:,.1f} MB")
-print(f"压缩比: {csv_bytes / parquet_bytes:.2f}x")
+print("=" * 55)
+print(f"  CSV     总大小: {csv_bytes / 1024 / 1024:>10,.2f} MB")
+print(f"  Parquet 总大小: {parquet_bytes / 1024 / 1024:>10,.2f} MB")
+print(f"  压缩比 (CSV / Parquet): {csv_bytes / parquet_bytes:>10,.2f} x")
+print("=" * 55)
+print(f"\n  💡 同样 {n:,} 行数据,Parquet 比 CSV 节省 {(1 - parquet_bytes / csv_bytes) * 100:.1f}% 空间")
+```
+
+```
+=======================================================
+  CSV     总大小:     308.06 MB
+  Parquet 总大小:      58.22 MB
+  压缩比 (CSV / Parquet):       5.29 x
+=======================================================
+
+  💡 同样 2,964,624 行数据,Parquet 比 CSV 节省 81.1% 空间
 ```
 
 **第 3 步:对比查询耗时**
@@ -387,38 +432,42 @@ print(f"\n查询 A 加速比: {t_csv_a / t_pq_a:.2f}x")
 print(f"查询 B 加速比: {t_csv_b / t_pq_b:.2f}x")
 ```
 
-**第 4 步:看 Spark UI 上的扫描量**
+```
+============================================================
+  查询 A: SELECT COUNT(*) — 测列裁剪 + Parquet metadata
+============================================================
+  [     CSV] 耗时:   0.50s  | 结果: 2964624
+  [ Parquet] 耗时:   0.22s  | 结果: 2964624
+  → 加速比: 2.24x
 
-打开 http://localhost:8080 → 点 Application "STAGE02-ODS-DDL" → SQL 标签页 → 找到刚才的查询,看每个 Stage 的 **"Bytes Read"**。重点关注 Parquet 查询的 Bytes Read 是不是远小于 CSV 的。
+============================================================
+  查询 B: WHERE + SUM — 测列裁剪 + 谓词下推
+============================================================
+  业务含义: 行程距离 > 5 英里的总营收
+  [     CSV] 耗时:   2.89s  | 结果: 29946845.159999676
+  [ Parquet] 耗时:   0.25s  | 结果: 29946845.16000478
+  → 加速比: 11.35x
 
-### 记录结果
-
-新建 `benchmarks/stage_02_csv_vs_parquet.md`,填表:
-
-```markdown
-# 实验 #1:CSV vs Parquet 对比
-
-| 维度 | CSV | Parquet | 倍数 |
-|------|-----|---------|------|
-| 文件大小 | ___ MB | ___ MB | ___x 压缩比 |
-| COUNT(*) 耗时 | ___ s | ___ s | ___x 提速 |
-| WHERE + SUM 耗时 | ___ s | ___ s | ___x 提速 |
-| Spark UI Bytes Read (CSV) | ___ MB | — | — |
-| Spark UI Bytes Read (Parquet) | — | ___ MB | — |
-
-## 结论
-- Parquet 列式存储让 SELECT 少数列时只需扫描需要的列文件块
-- Parquet 内置 Snappy 压缩,体积比 CSV 小 ___倍
-- 谓词下推让 WHERE 条件在文件读取阶段就被应用,IO 量减少 ___倍
+============================================================
+  汇总:
+    查询 A (COUNT)   : CSV 0.50s  vs  Parquet 0.22s  → 2.2x
+    查询 B (WHERE+SUM): CSV 2.89s  vs  Parquet 0.25s  → 11.3x
+============================================================
 ```
 
 ### 实验后清理
 
 ```python
-# 删除对比用临时数据,避免占用 HDFS 空间
-spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration()) \
-    .delete(spark._jvm.org.apache.hadoop.fs.Path("hdfs://namenode:9000/nyc-taxi/ods/_benchmark"), True)
-print("✅ 临时数据已清理")
+fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+fs.delete(spark._jvm.org.apache.hadoop.fs.Path("hdfs://namenode:9000/nyc-taxi/ods/_benchmark"), True)
+print("✅ 临时对比数据已清理")
+
+# 验证
+ls_out = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration()) \
+    .listStatus(spark._jvm.org.apache.hadoop.fs.Path("hdfs://namenode:9000/nyc-taxi/ods"))
+print("\nODS 目录现有内容:")
+for s in ls_out:
+    print(f"  {s.getPath().getName()}")
 ```
 
 ---

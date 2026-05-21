@@ -11,6 +11,7 @@
 - [STAGE 02](docs/STAGE_02_数据接入与ODS层.md) — 数据接入与 ODS 层（含 2 个踩坑实录 + CSV vs Parquet 对比实验）
 - [STAGE 03](docs/STAGE_03_存储层优化.md) — 存储层优化（Zstd / 分区裁剪 / 小文件治理 三项量化实验）
 - [STAGE 04](docs/STAGE_04_DWD层与数据清洗.md) — DWD 层与数据清洗（96.57% 可信率 + Broadcast Join 3.75x 加速 + 业务洞察）
+- [STAGE 05](docs/STAGE_05_计算层深度优化.md) — 计算层深度优化（谓词下推 / AQE 3.82x / CBO 1.71x）
 
 ## 启动
 
@@ -38,7 +39,8 @@ docker compose -f docker/docker-compose.serving.yml up -d
 - [x] **STAGE 02**: 数据接入与 ODS 层 — 955 万行入库，踩 2 坑（CSV 解析、上游 schema 变更），CSV vs Parquet 实验完成（**12.2x 加速 / 5.3x 压缩**）
 - [x] **STAGE 03**: 存储层优化 — 三项实验完成:**Zstd 全面胜出**(24% 空间节省 + 42% 读取加速)、**分区裁剪 2.77x 加速**、**小文件治理 20.3x 加速 + 15.6% 存储节省**
 - [x] **STAGE 04**: DWD 层与数据清洗 — 9.55M→9.23M (**96.57% 可信率**) + 11 业务衍生字段 + **Broadcast Join 3.75x 加速** + 业务洞察(早高峰仅晚高峰 53% / 机场客单价 3.5x)
-- [ ] STAGE 05: 计算层优化
+- [x] **STAGE 05**: 计算层深度优化 — 三项实验完成:**谓词下推 UDF 拖慢 2.63x**(PushedFilters 失效 + BatchEvalPython)、**AQE 加速 3.82x**(200→动态合并)、**CBO Join Reorder 1.71x**(ANALYZE 统计)
+- [ ] STAGE 06: 数据倾斜实战
 - [ ] STAGE 06: 数据倾斜实战
 - [ ] STAGE 07: DWS 层与查询优化
 - [ ] STAGE 08: ADS 层 + PostgreSQL 索引

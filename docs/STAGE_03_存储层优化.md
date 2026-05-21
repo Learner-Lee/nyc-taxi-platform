@@ -50,6 +50,7 @@ serving 组仍然不需要。
 | **Gzip** | 2.5-3.5x | 慢 | 中等 | 历史遗留(Hadoop 早期),现在很少在大数据用 |
 
 **业务类比**:
+
 - Snappy = 真空压缩袋(压一压塞进去快,要用拿出来快,体积小一点)
 - Zstd = 抽真空+折叠+捆扎(费点劲,但更小,适合长期存放)
 - Gzip = 还在用塑料绳捆衣服(旧但能用)
@@ -74,6 +75,7 @@ serving 组仍然不需要。
 **业务类比**:NameNode 像图书馆的目录管理员,**每本书的卡片都要记**——不管这本书是 1KB 还是 1GB,卡片大小相同。100 万个 1KB 文件,目录卡片占用 = 100 万张卡片;1 个 1GB 文件,1 张卡片。
 
 **两个具体后果**:
+
 1. **NameNode 内存压力**:每个文件元数据约占 150 字节,100 万小文件 ≈ 150MB 内存
 2. **Spark Task 数膨胀**:Spark 默认每个文件至少 1 个 Task,小文件越多 Task 越多,调度开销 > 计算开销
 
@@ -88,7 +90,6 @@ serving 组仍然不需要。
 ### 步骤 1:在 Jupyter 准备公共辅助函数
 
 ```python
-# 重新建一个 SparkSession (如果之前的还在,可以不用)
 from pyspark.sql import SparkSession
 import time
 
@@ -100,28 +101,44 @@ spark = SparkSession.builder \
     .enableHiveSupport() \
     .getOrCreate()
 
-# 公共工具:计算 HDFS 路径总字节数
+# Hadoop FS API 句柄(读 HDFS 文件大小用)
 fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
 Path = spark._jvm.org.apache.hadoop.fs.Path
 
+
 def hdfs_size_bytes(path):
+    """返回 HDFS 路径下所有文件的总字节数"""
     total = 0
     files = fs.listFiles(Path(path), True)
     while files.hasNext():
         total += files.next().getLen()
     return total
 
+
 def hdfs_size_mb(path):
     return hdfs_size_bytes(path) / 1024 / 1024
 
+
 def timeit(label, fn):
+    """计时执行 fn,返回(耗时秒, 结果)"""
     t0 = time.time()
     result = fn()
     elapsed = time.time() - t0
-    print(f"  [{label:>10}] {elapsed:>6.2f}s")
+    print(f"  [{label:>16}] {elapsed:>6.2f}s")
     return elapsed, result
 
-print("✅ 辅助函数就绪")
+
+# 快速自检
+print(f"Spark: {spark.version}")
+print(f"Hive 模式: {spark.conf.get('spark.sql.catalogImplementation')}")
+# 先检查表是否存在
+tables = spark.sql("SHOW TABLES IN ods").filter("tableName == 'yellow_trips'").count()
+if tables >= 1:
+    print("✅ ods.yellow_trips 表存在")
+else:
+    print("⚠️  表不存在，需要重建")
+print(f"ODS 表行数: {spark.sql('SELECT COUNT(*) FROM ods.yellow_trips').collect()[0][0]:,}")
+print("\n✅ 环境就绪,可以开始实验 #2")
 ```
 
 ---
@@ -140,45 +157,47 @@ print("✅ 辅助函数就绪")
 ### 实验代码
 
 ```python
+# 缓存源数据,避免每轮都重新读
 df_jan = spark.read.parquet("hdfs://namenode:9000/nyc-taxi/ods/yellow_trips/year=2024/month=01")
-df_jan.cache().count()  # 触发缓存避免重复读源数据
+df_jan.cache().count()
 
 base_path = "hdfs://namenode:9000/nyc-taxi/ods/_bench_compress"
-
 results = {}
+
 for codec in ["uncompressed", "snappy", "zstd"]:
+    print(f"\n>>> 测试压缩算法: {codec}")
     path = f"{base_path}/{codec}"
 
-    # 写入
-    t_write, _ = timeit(f"{codec}-write",
-        lambda: df_jan.write.mode("overwrite").option("compression", codec).parquet(path)
-    )
+    # 写入计时
+    t_write, _ = timeit(f"{codec}-write",lambda: df_jan.write.mode("overwrite").option("compression", codec).parquet(path))
 
-    # 大小
+    # 文件大小
     size_mb = hdfs_size_mb(path)
+    print(f"  [{codec + '-size':>16}] {size_mb:>6.2f} MB")
 
-    # 读取 + 一个有意义的聚合 (避免被惰性优化掉)
-    t_read, _ = timeit(f"{codec}-read",
-        lambda: spark.read.parquet(path).agg({"total_amount": "sum"}).collect()
-    )
+    # 读取 + 聚合(避免懒计算被优化掉)
+    t_read, _ = timeit(f"{codec}-read+agg",lambda: spark.read.parquet(path).agg({"total_amount": "sum"}).collect())
 
     results[codec] = {"write_s": t_write, "size_mb": size_mb, "read_s": t_read}
 
-# 漂亮的对比表格
-print("\n" + "=" * 70)
-print(f"  {'算法':<14} {'写入耗时':<12} {'文件大小':<14} {'读取+聚合耗时':<14}")
-print("=" * 70)
+# 对比表格
+print("\n" + "=" * 72)
+print(f"  {'算法':<14} {'写入':<12} {'大小':<14} {'读取+聚合':<14} {'相对Snappy':<10}")
+print("=" * 72)
+snappy_size = results["snappy"]["size_mb"]
 for codec, r in results.items():
-    print(f"  {codec:<14} {r['write_s']:>8.2f}s   {r['size_mb']:>10.2f} MB   {r['read_s']:>8.2f}s")
-print("=" * 70)
+    rel = (r["size_mb"] / snappy_size - 1) * 100
+    rel_str = f"+{rel:.1f}%" if rel > 0 else f"{rel:.1f}%"
+    print(f"  {codec:<14} {r['write_s']:>6.2f}s     {r['size_mb']:>8.2f} MB   {r['read_s']:>6.2f}s     {rel_str:>8}")
+print("=" * 72)
 
-# 以 snappy 为基准,看 zstd 节省多少 / 多花多少 CPU
-snappy = results["snappy"]
+# Zstd vs Snappy 三维对比(简历重点)
 zstd = results["zstd"]
-print(f"\n  Zstd vs Snappy:")
-print(f"    空间节省: {(1 - zstd['size_mb']/snappy['size_mb'])*100:.1f}%")
-print(f"    写入慢:   {zstd['write_s']/snappy['write_s']:.2f}x")
-print(f"    读取差异: {zstd['read_s']/snappy['read_s']:.2f}x")
+snappy = results["snappy"]
+print(f"\n  💡 Zstd vs Snappy:")
+print(f"     • 空间节省: {(1 - zstd['size_mb'] / snappy['size_mb']) * 100:.1f}%")
+print(f"     • 写入速度: {'快' if zstd['write_s'] < snappy['write_s'] else '慢'} {abs(zstd['write_s'] / snappy['write_s']):.2f}x")
+print(f"     • 读取速度: {'快' if zstd['read_s'] < snappy['read_s'] else '慢'} {abs(zstd['read_s'] / snappy['read_s']):.2f}x")
 ```
 
 ### 📊 实测结果(2026-05-17,2024-01 数据 296 万行)
@@ -194,6 +213,7 @@ print(f"    读取差异: {zstd['read_s']/snappy['read_s']:.2f}x")
 教科书说"Zstd 用 CPU 换空间"(写入应该更慢),**但实测 Zstd 反而全面更快**。原因:
 
 **Spark + HDFS 场景下,IO 是瓶颈,不是 CPU**。读 Parquet 耗时 = `IO 时间 + 解压 CPU 时间`,当 IO 远大于 CPU 时:
+
 - Snappy:IO 大(58MB) + CPU 小(解压快) ← 旧时代假设(2010s CPU 弱)
 - Zstd:IO 小(44MB) + CPU 中等(解压略慢)
 - 结果:**文件小的优势盖过 CPU 代价**,Zstd 反而更快
@@ -280,7 +300,7 @@ spark.sql("""
 |------|------|------|
 | A 全表扫描 | 0.72s | (基准) |
 | B 命中分区键 | 0.26s | **2.77x** |
-| C CAST 包裹 | 0.18s | 4.08x |
+| C CAST 包裹（新版可以识别到） | 0.18s | 4.08x |
 
 ### EXPLAIN 物理证据(查询 B)
 ```
@@ -304,13 +324,19 @@ ReadSchema: struct<total_amount:double>                       ← 19 列只读 1
 ### 实验代码
 
 ```python
-# 1. 故意制造 1000 个小文件(用 repartition 强行打散)
-bad_path = "hdfs://namenode:9000/nyc-taxi/ods/_bench_smallfiles/bad"
-print("写入 1000 个小文件(慢,约 30-60s)...")
-df_jan.repartition(1000).write.mode("overwrite").parquet(bad_path)
+df_jan = spark.read.parquet("hdfs://namenode:9000/nyc-taxi/ods/yellow_trips/year=2024/month=01")
+df_jan.cache().count()
 
-# 2. 统计文件数和平均大小
-def count_files(path):
+# ── 1. 故意制造 1000 个小文件 ─────────────────────
+bad_path = "hdfs://namenode:9000/nyc-taxi/ods/_bench_smallfiles/bad"
+print(">>> 写入 1000 个小文件(repartition 会触发 shuffle,稍慢)...")
+t_bad_write, _ = timeit("1000个小文件-写入",
+                        lambda: df_jan.repartition(1000).write.mode("overwrite").parquet(bad_path)
+                        )
+
+
+# ── 2. 统计文件数和平均大小 ───────────────────────
+def count_parquet_files(path):
     files = fs.listFiles(Path(path), True)
     n = 0
     while files.hasNext():
@@ -319,32 +345,46 @@ def count_files(path):
             n += 1
     return n
 
-n_bad = count_files(bad_path)
+
+n_bad = count_parquet_files(bad_path)
 size_bad_mb = hdfs_size_mb(bad_path)
-print(f"\n  bad 路径: {n_bad} 个文件, 总大小 {size_bad_mb:.2f} MB")
-print(f"  平均文件大小: {size_bad_mb*1024/n_bad:.1f} KB  ← 严重小文件!")
+print(f"\n  bad 路径: {n_bad} 个 parquet 文件")
+print(f"  总大小: {size_bad_mb:.2f} MB")
+print(f"  平均文件大小: {size_bad_mb * 1024 / n_bad:.1f} KB  ← 严重小文件!(HDFS Block 是 131072 KB)")
 
-# 3. 读取耗时对比 - 小文件 vs 大文件
-print("\n=== 读取耗时对比 ===")
-t_bad_read, _ = timeit("1000个小文件",
-    lambda: spark.read.parquet(bad_path).agg({"total_amount": "sum"}).collect()
-)
+# ── 3. 读取耗时 ──────────────────────────────────
+print("\n>>> 读取 1000 个小文件...")
+t_bad_read, _ = timeit("1000小文件-读取",
+                       lambda: spark.read.parquet(bad_path).agg({"total_amount": "sum"}).collect()
+                       )
 
-# 4. 治理:coalesce 合并成 4 个文件
+# ── 4. 治理:coalesce 合并成 4 个文件 ──────────────
 good_path = "hdfs://namenode:9000/nyc-taxi/ods/_bench_smallfiles/good"
-spark.read.parquet(bad_path).coalesce(4).write.mode("overwrite").parquet(good_path)
-n_good = count_files(good_path)
+print("\n>>> 用 coalesce(4) 合并成 4 个文件...")
+t_good_write, _ = timeit("coalesce(4)-写入",
+                         lambda: spark.read.parquet(bad_path).coalesce(4).write.mode("overwrite").parquet(good_path)
+                         )
+
+n_good = count_parquet_files(good_path)
 size_good_mb = hdfs_size_mb(good_path)
-print(f"\n  治理后 good 路径: {n_good} 个文件, 总大小 {size_good_mb:.2f} MB")
-print(f"  平均文件大小: {size_good_mb/n_good:.1f} MB")
+print(f"\n  good 路径: {n_good} 个 parquet 文件")
+print(f"  总大小: {size_good_mb:.2f} MB")
+print(f"  平均文件大小: {size_good_mb / n_good:.1f} MB")
 
-t_good_read, _ = timeit("4个合理文件",
-    lambda: spark.read.parquet(good_path).agg({"total_amount": "sum"}).collect()
-)
+print("\n>>> 读取 4 个合理大小文件...")
+t_good_read, _ = timeit("4大文件-读取",
+                        lambda: spark.read.parquet(good_path).agg({"total_amount": "sum"}).collect()
+                        )
 
-print(f"\n=== 治理收益 ===")
-print(f"  读取加速: {t_bad_read/t_good_read:.2f}x")
-print(f"  文件数减少: {n_bad}→{n_good} ({n_bad/n_good:.0f}x 减少)")
+# ── 5. 汇总 ─────────────────────────────────────
+print("\n" + "=" * 60)
+print(f"  {'指标':<20} {'1000小文件':<15} {'4大文件':<15} {'变化':<10}")
+print("=" * 60)
+print(f"  {'文件数':<20} {n_bad:<15} {n_good:<15} {n_bad / n_good:.0f}x↓")
+print(f"  {'平均文件大小':<20} {f'{size_bad_mb * 1024 / n_bad:.1f} KB':<15} {f'{size_good_mb / n_good:.1f} MB':<15} —")
+print(f"  {'读取耗时':<20} {f'{t_bad_read:.2f}s':<15} {f'{t_good_read:.2f}s':<15} {t_bad_read / t_good_read:.2f}x↑")
+print("=" * 60)
+print(f"\n  💡 治理收益: 文件数 ÷ {n_bad / n_good:.0f},读取加速 × {t_bad_read/t_good_read:.2f}")
 ```
 
 ### 📊 实测结果(2026-05-17)
