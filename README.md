@@ -12,6 +12,7 @@
 - [STAGE 03](docs/STAGE_03_存储层优化.md) — 存储层优化（Zstd / 分区裁剪 / 小文件治理 三项量化实验）
 - [STAGE 04](docs/STAGE_04_DWD层与数据清洗.md) — DWD 层与数据清洗（96.57% 可信率 + Broadcast Join 3.75x 加速 + 业务洞察）
 - [STAGE 05](docs/STAGE_05_计算层深度优化.md) — 计算层深度优化（谓词下推 / AQE 3.82x / CBO 1.71x）
+- [STAGE 06](docs/STAGE_06_数据倾斜实战.md) — 数据倾斜实战（朴素 122x → 加盐 23x → AQE Skew Join 2.89x 加速）
 
 ## 启动
 
@@ -40,8 +41,8 @@ docker compose -f docker/docker-compose.serving.yml up -d
 - [x] **STAGE 03**: 存储层优化 — 三项实验完成:**Zstd 全面胜出**(24% 空间节省 + 42% 读取加速)、**分区裁剪 2.77x 加速**、**小文件治理 20.3x 加速 + 15.6% 存储节省**
 - [x] **STAGE 04**: DWD 层与数据清洗 — 9.55M→9.23M (**96.57% 可信率**) + 11 业务衍生字段 + **Broadcast Join 3.75x 加速** + 业务洞察(早高峰仅晚高峰 53% / 机场客单价 3.5x)
 - [x] **STAGE 05**: 计算层深度优化 — 三项实验完成:**谓词下推 UDF 拖慢 2.63x**(PushedFilters 失效 + BatchEvalPython)、**AQE 加速 3.82x**(200→动态合并)、**CBO Join Reorder 1.71x**(ANALYZE 统计)
-- [ ] STAGE 06: 数据倾斜实战
-- [ ] STAGE 06: 数据倾斜实战
+- [x] **STAGE 06**: 数据倾斜实战 — Join 三方案对比:**朴素 Max/Median 122.1x → 加盐法 23x(6.2x↓)→ AQE Skew Join 0.75s(2.89x 加速,零 SQL 修改)** + 反直觉洞察(partial aggregate 让 GroupBy 倾斜自愈)
+- [ ] STAGE 07: DWS 层与查询优化
 - [ ] STAGE 07: DWS 层与查询优化
 - [ ] STAGE 08: ADS 层 + PostgreSQL 索引
 - [ ] STAGE 09: 冷热分层：ClickHouse 接入
