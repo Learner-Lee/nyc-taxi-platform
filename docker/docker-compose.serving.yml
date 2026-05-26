@@ -1,117 +1,75 @@
-version: "3.8"
-
-# ============================================================
-# NYC Taxi Platform — serving 组（按需启动）
-# STAGE 09+ 才需要 ClickHouse
-# STAGE 10+ 才需要 Airflow
-# STAGE 11+ 才需要 Superset
-# STAGE 12+ 才需要 Streamlit
-#
-# 启动全部: docker compose -f docker/docker-compose.serving.yml up -d
-# 只启动 ClickHouse: docker compose -f docker/docker-compose.serving.yml up -d clickhouse
-# ============================================================
-
 networks:
   taxi-net:
-    external: true   # 复用 core 组的网络
+    external: true
+    name: docker_taxi-net
 
 volumes:
   clickhouse-data:
-  airflow-db:
   superset-data:
 
 services:
-
-  # ── ClickHouse（STAGE 09+）────────────────────────────────
   clickhouse:
     image: clickhouse/clickhouse-server:23.8
+    platform: linux/amd64
     container_name: clickhouse
     hostname: clickhouse
     ports:
-      - "8123:8123"   # HTTP 接口（Play UI）
-      - "9009:9009"   # Native 协议
+      - "8123:8123"
+      - "9009:9009"
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
     volumes:
       - clickhouse-data:/var/lib/clickhouse
+      - ../data:/data
       - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml
       - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/custom.xml
-    networks:
-      - taxi-net
-    ulimits:
-      nofile:
-        soft: 262144
-        hard: 262144
-    healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # ── Airflow（STAGE 10+）───────────────────────────────────
-  airflow-db:
-    image: postgres:15
-    container_name: airflow-db
-    environment:
-      - POSTGRES_DB=airflow
-      - POSTGRES_USER=airflow
-      - POSTGRES_PASSWORD=airflow123
-    volumes:
-      - airflow-db:/var/lib/postgresql/data
     networks:
       - taxi-net
 
   airflow:
     image: apache/airflow:2.7.3
+    platform: linux/amd64
     container_name: airflow
-    env_file: docker/.env
     environment:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow123@airflow-db/airflow
-      - AIRFLOW__CORE__FERNET_KEY=ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg=
-      - AIRFLOW__WEBSERVER__SECRET_KEY=taxi-platform-secret
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://taxi_user:taxi_pass123@postgres:5432/airflow
       - AIRFLOW__CORE__LOAD_EXAMPLES=false
-      - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=true
+      - AIRFLOW__CORE__FERNET_KEY=ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg=
+      - AIRFLOW__WEBSERVER__SECRET_KEY=nyc-taxi-secret
     ports:
       - "8081:8080"
     volumes:
       - ../airflow/dags:/opt/airflow/dags
       - ../jobs:/opt/airflow/jobs
-      - ../data:/data
-    depends_on:
-      - airflow-db
     command: >
-      bash -c "
-        airflow db init &&
-        airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@nyctaxi.com &&
-        airflow webserver &
-        airflow scheduler
-      "
+      bash -c "airflow db migrate &&
+               (airflow users create --username admin --password admin --firstname A --lastname B --role Admin --email a@b.com || true) &&
+               (airflow scheduler &) && airflow webserver"
     networks:
       - taxi-net
 
-  # ── Superset（STAGE 11+）──────────────────────────────────
   superset:
     image: apache/superset:3.0.1
+    platform: linux/amd64
     container_name: superset
-    env_file: docker/.env
     environment:
-      - SUPERSET_SECRET_KEY=taxi-superset-secret-key-2024
+      - SUPERSET_SECRET_KEY=nyc-taxi-superset-secret-key-2024
     ports:
       - "8088:8088"
     volumes:
       - superset-data:/app/superset_home
     command: >
-      bash -c "
-        superset db upgrade &&
-        superset fab create-admin --username admin --firstname Admin --lastname User --email admin@nyctaxi.com --password admin &&
-        superset init &&
-        superset run -h 0.0.0.0 -p 8088
-      "
+      bash -c "pip install clickhouse-connect &&
+               superset db upgrade &&
+               (superset fab create-admin --username admin --firstname A --lastname B --email a@b.com --password admin || true) &&
+               superset init &&
+               superset run -h 0.0.0.0 -p 8088"
     networks:
       - taxi-net
 
-  # ── Streamlit（STAGE 12+）────────────────────────────────
   streamlit:
     image: python:3.11-slim
+    platform: linux/amd64
     container_name: streamlit
     ports:
       - "8501:8501"
@@ -119,9 +77,7 @@ services:
       - ../streamlit:/app
     working_dir: /app
     command: >
-      bash -c "
-        pip install streamlit pandas psycopg2-binary plotly &&
-        streamlit run driver_app.py --server.address 0.0.0.0
-      "
+      bash -c "pip install streamlit pandas psycopg2-binary &&
+               streamlit run driver_app.py --server.address 0.0.0.0 --server.port 8501"
     networks:
       - taxi-net
