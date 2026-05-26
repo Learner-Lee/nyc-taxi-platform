@@ -15,6 +15,7 @@
 - [STAGE 06](docs/STAGE_06_数据倾斜实战.md) — 数据倾斜实战（朴素 122x → 加盐 23x → AQE Skew Join 2.89x 加速）
 - [STAGE 07](docs/STAGE_07_DWS层与查询优化.md) — DWS 层与查询优化（行数缩减 452x / 窗口函数 1.70x / HyperLogLog 3.20x）
 - [STAGE 08](docs/STAGE_08_ADS层与PG索引.md) — ADS 层 + PostgreSQL 索引（5 阶段对比 254x 加速 / IO 680x↓）
+- [STAGE 09](docs/STAGE_09_ClickHouse冷热分层.md) — 冷热分层 ClickHouse（CH vs Spark 聚合 9.6x 加速）
 
 ## 启动
 
@@ -46,7 +47,8 @@ docker compose -f docker/docker-compose.serving.yml up -d
 - [x] **STAGE 06**: 数据倾斜实战 — Join 三方案对比:**朴素 Max/Median 122.1x → 加盐法 23x(6.2x↓)→ AQE Skew Join 0.75s(2.89x 加速,零 SQL 修改)** + 反直觉洞察(partial aggregate 让 GroupBy 倾斜自愈)
 - [x] **STAGE 07**: DWS 层与查询优化 — DWS 物化(**行数缩减 452x / 体积压缩 85x**)+ 窗口函数 **1.70x** + HyperLogLog **3.20x(误差 2.33%)** + 业务洞察(黑色周日 / 打车密度指标)
 - [x] **STAGE 08**: ADS 层 + PostgreSQL 索引 — ADS 入 PG + 索引 5 阶段对比:**Seq Scan 6.10ms → 部分索引 0.024ms(254x 加速,IO 680x↓)** + 低选择性列单列索引被优化器放弃的洞察
-- [ ] STAGE 09: 冷热分层：ClickHouse 接入
+- [x] **STAGE 09**: 冷热分层 ClickHouse — 920 万行入 MergeTree + **CH vs Spark 聚合 9.6x 加速**(首查就快 3.4x,无 JVM 开销)+ 踩通 3 种导入方式
+- [ ] STAGE 10: Airflow 调度编排
 - [ ] STAGE 07: DWS 层与查询优化
 - [ ] STAGE 08: ADS 层 + PostgreSQL 索引
 - [ ] STAGE 09: 冷热分层：ClickHouse 接入
