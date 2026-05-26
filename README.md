@@ -18,6 +18,7 @@
 - [STAGE 09](docs/STAGE_09_ClickHouse冷热分层.md) — 冷热分层 ClickHouse（CH vs Spark 聚合 9.6x 加速）
 - [STAGE 10](docs/STAGE_10_Airflow调度编排.md) — Airflow 调度编排（ETL DAG + 幂等性验证）
 - [STAGE 11](docs/STAGE_11_Superset看板.md) — Superset 双看板（运营 CH + 财务 PG + 过滤器联动）
+- [STAGE 12](docs/STAGE_12_Streamlit司机应用.md) — Streamlit 司机端推荐应用（纯 Python + PG 覆盖索引）
 
 ## 启动
 
@@ -52,7 +53,8 @@ docker compose -f docker/docker-compose.serving.yml up -d
 - [x] **STAGE 09**: 冷热分层 ClickHouse — 920 万行入 MergeTree + **CH vs Spark 聚合 9.6x 加速**(首查就快 3.4x,无 JVM 开销)+ 踩通 3 种导入方式
 - [x] **STAGE 10**: Airflow 调度编排 — 3-task ETL DAG + 失败重试 + **幂等性验证(重跑 2 次数据零翻倍)** + 复用 PG 元数据库
 - [x] **STAGE 11**: Superset 看板 — 运营(ClickHouse)+ 财务(PostgreSQL)双看板,7 图表 + 过滤器联动,三大洞察可视化(机场金矿/早高峰弱/黑色周日)
-- [ ] STAGE 12: Streamlit 司机应用
+- [x] **STAGE 12**: Streamlit 司机应用 — 纯 Python 司机接单推荐 App(连 PG + 覆盖索引,st.cache_data 缓存),五类用户全覆盖闭环
+- [ ] STAGE 13: 项目复盘与简历输出
 - [ ] STAGE 07: DWS 层与查询优化
 - [ ] STAGE 08: ADS 层 + PostgreSQL 索引
 - [ ] STAGE 09: 冷热分层：ClickHouse 接入
