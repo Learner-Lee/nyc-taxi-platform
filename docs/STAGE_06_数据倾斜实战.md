@@ -40,6 +40,7 @@ docker restart jupyter && sleep 10
 **业务类比**:你在便利店当店长,排了 6 个收银台。**99% 的顾客都挤到 1 号收银台**(因为靠门),其他 5 个台子的收银员闲着——这 1 个台子的吞吐量决定了整个便利店的速度。
 
 **Spark 里的对应**:
+
 - 6 个收银台 = 6 个 Spark Task(并行)
 - 顾客 = 数据行
 - 顾客挤到 1 号 = 90% 数据的 key 都相同
@@ -56,6 +57,7 @@ docker restart jupyter && sleep 10
 
 ### 概念 3:加盐法(Salting)的原理
 **两阶段聚合**:
+
 ```
 原始 GroupBy:   1000W 行 [key=A] → 1 个 task 处理 → 慢
 加盐 GroupBy:   1000W 行 [key=A] → 拆成 [A_0, A_1, ..., A_15] → 16 个 task 处理 → 快
@@ -69,6 +71,7 @@ docker restart jupyter && sleep 10
 Spark 3.0+ 的 AQE 能**自动检测**:某个 partition 远大于平均(默认大于中位数 5 倍 + 大于 256MB),就把它**拆分成多个小 task**。
 
 **前提**:
+
 - `spark.sql.adaptive.enabled = true`(STAGE 05 默认就开了)
 - `spark.sql.adaptive.skewJoin.enabled = true`(默认开)
 - 必须是 **Join** 才生效——纯 GroupBy 不在 Skew Join 范围内(GroupBy 倾斜要靠加盐)
@@ -91,22 +94,69 @@ spark = SparkSession.builder \
     .enableHiveSupport() \
     .getOrCreate()
 
-# 工具函数(STAGE 05 用过)
+# 工具(STAGE 05 用过)
 fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
 Path = spark._jvm.org.apache.hadoop.fs.Path
 
+# 自检
+print(f"Spark: {spark.version}")
 print(f"DWD 行数: {spark.sql('SELECT COUNT(*) FROM dwd.fact_trips').collect()[0][0]:,}")
 
-# 看 PULocationID 真实分布(应该已经有自然倾斜)
-print("\n>>> PULocationID Top 10(看自然分布)")
+# 看 PULocationID 真实分布(NYC 数据本身就有自然倾斜)
+print("\n>>> PULocationID Top 10 自然分布")
 spark.sql("""
-    SELECT PULocationID, COUNT(*) AS trips,
+    SELECT PULocationID,
+           pickup_zone,
+           COUNT(*) AS trips,
            ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct
     FROM dwd.fact_trips
-    GROUP BY PULocationID
+    GROUP BY PULocationID, pickup_zone
     ORDER BY trips DESC
     LIMIT 10
+""").show(truncate=False)
+
+# 看 Top 1 的占比(自然倾斜程度)
+print(">>> 倾斜度统计")
+spark.sql("""
+    SELECT
+        MAX(trips) AS max_trips,
+        MIN(trips) AS min_trips,
+        ROUND(AVG(trips), 0) AS avg_trips,
+        ROUND(MAX(trips) / AVG(trips), 1) AS max_to_avg_ratio
+    FROM (
+        SELECT PULocationID, COUNT(*) AS trips
+        FROM dwd.fact_trips
+        GROUP BY PULocationID
+    )
 """).show()
+```
+
+```
+Spark: 3.4.1
+DWD 行数: 9,227,227
+
+>>> PULocationID Top 10 自然分布
++------------+----------------------------+------+----+
+|PULocationID|pickup_zone                 |trips |pct |
++------------+----------------------------+------+----+
+|161         |Midtown Center              |442545|4.80|
+|237         |Upper East Side South       |430313|4.66|
+|132         |JFK Airport                 |408360|4.43|
+|236         |Upper East Side North       |407801|4.42|
+|162         |Midtown East                |328280|3.56|
+|230         |Times Sq/Theatre District   |320152|3.47|
+|186         |Penn Station/Madison Sq West|311722|3.38|
+|142         |Lincoln Square East         |308385|3.34|
+|138         |LaGuardia Airport           |278613|3.02|
+|239         |Upper West Side South       |274619|2.98|
++------------+----------------------------+------+----+
+
+>>> 倾斜度统计
++---------+---------+---------+----------------+
+|max_trips|min_trips|avg_trips|max_to_avg_ratio|
++---------+---------+---------+----------------+
+|   442545|        1|  35353.0|            12.5|
++---------+---------+---------+----------------+
 ```
 
 **预期发现**:NYC 的 Yellow Taxi 在 Midtown(LocationID 161 / 237)和 JFK(132)有自然倾斜,Top 3 通常占 20% 以上。
@@ -116,7 +166,11 @@ spark.sql("""
 ### 步骤 2:**人为制造严重倾斜**(放大效果让实验更直观)
 
 ```python
-# 制造一个倾斜更严重的派生表:90% 的 key 都是 132 (JFK)
+print("=" * 60)
+print("  制造极端倾斜表:dwd.fact_trips_skewed(90% 数据 key=132)")
+print("=" * 60)
+
+# 用 CTAS 一步建表
 spark.sql("DROP TABLE IF EXISTS dwd.fact_trips_skewed")
 spark.sql("""
 CREATE TABLE dwd.fact_trips_skewed
@@ -125,7 +179,7 @@ LOCATION 'hdfs://namenode:9000/nyc-taxi/dwd/fact_trips_skewed'
 AS
 SELECT
     CASE
-        WHEN rand() < 0.9 THEN 132    -- 90% 数据强制为 JFK 机场
+        WHEN rand() < 0.9 THEN 132    -- 90% 强制为 JFK(LocationID=132)
         ELSE PULocationID
     END AS pu_id,
     total_amount,
@@ -136,17 +190,58 @@ WHERE year=2024 AND month=1
 """)
 
 # 验证倾斜程度
-print(">>> 倾斜表的 key 分布(应该看到 132 占 90%)")
+print("\n>>> 倾斜表的 key 分布")
 spark.sql("""
-    SELECT pu_id, COUNT(*) AS cnt,
+    SELECT pu_id,
+           COUNT(*) AS cnt,
            ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct
     FROM dwd.fact_trips_skewed
     GROUP BY pu_id
     ORDER BY cnt DESC
-    LIMIT 5
+    LIMIT 8
 """).show()
 
-print(f"\n倾斜表总行数: {spark.sql('SELECT COUNT(*) FROM dwd.fact_trips_skewed').collect()[0][0]:,}")
+total = spark.sql("SELECT COUNT(*) FROM dwd.fact_trips_skewed").collect()[0][0]
+print(f"倾斜表总行数: {total:,}")
+
+# 看新表的倾斜度
+print("\n>>> 极端倾斜度(对比自然分布的 12.5x)")
+spark.sql("""
+    SELECT
+        MAX(cnt) AS max_cnt,
+        ROUND(AVG(cnt), 0) AS avg_cnt,
+        ROUND(MAX(cnt) / AVG(cnt), 1) AS max_to_avg_ratio
+    FROM (SELECT pu_id, COUNT(*) AS cnt FROM dwd.fact_trips_skewed GROUP BY pu_id)
+""").show()
+```
+
+```
+============================================================
+  制造极端倾斜表:dwd.fact_trips_skewed(90% 数据 key=132)
+============================================================
+
+>>> 倾斜表的 key 分布
++-----+-------+-----+
+|pu_id|    cnt|  pct|
++-----+-------+-----+
+|  132|2597189|90.49|
+|  237|  13910| 0.48|
+|  161|  13853| 0.48|
+|  236|  13401| 0.47|
+|  162|  10556| 0.37|
+|  186|  10347| 0.36|
+|  142|  10267| 0.36|
+|  230|  10232| 0.36|
++-----+-------+-----+
+
+倾斜表总行数: 2,870,077
+
+>>> 极端倾斜度(对比自然分布的 12.5x)
++-------+-------+----------------+
+|max_cnt|avg_cnt|max_to_avg_ratio|
++-------+-------+----------------+
+|2597189|12059.0|           215.4|
++-------+-------+----------------+
 ```
 
 **预期看到**:`pu_id=132` 占 90%(约 260 万行),其他 5 个 pu_id 加起来 10%。
@@ -165,9 +260,10 @@ print(f"\n倾斜表总行数: {spark.sql('SELECT COUNT(*) FROM dwd.fact_trips_sk
 
 ```python
 print("=" * 60)
-print("  A: 朴素 GroupBy(关闭 AQE 突出倾斜)")
+print("  实验 #9-A: 朴素 GroupBy(关闭 AQE,让倾斜暴露)")
 print("=" * 60)
-# 关闭 AQE,让倾斜暴露
+
+# 关闭 AQE,使倾斜不被自动处理
 spark.conf.set("spark.sql.adaptive.enabled", "false")
 spark.conf.set("spark.sql.shuffle.partitions", "200")
 
@@ -182,19 +278,195 @@ result_a = spark.sql("""
 """).collect()
 t_a = time.time() - t0
 
-print(f"耗时: {t_a:.2f}s")
-print(f"App ID: {spark.sparkContext.applicationId}")
-print("\n>>> 🔍 打开 Spark UI: http://localhost:8080")
-print("   1. 点最近 Application → SQL 标签 → 找这条 query")
-print("   2. 看 Stage 详情里的 'Summary Metrics for Tasks'")
-print("   3. 重点看 'Duration' 行的 Min / Median / Max")
-print("   4. 倾斜的标志:Max 远大于 Median(可能 10-100x)")
+print(f"\n耗时: {t_a:.2f}s")
+print(f"\n>>> 结果(应该看到 132 占绝对主导)")
+for r in result_a[:5]:
+    print(f"  pu_id={r['pu_id']}, cnt={r['cnt']:>9,}, revenue=${r['revenue']:>14,.2f}")
+
+print(f"\n>>> Spark App ID: {spark.sparkContext.applicationId}")
+print(f">>> Spark UI: http://localhost:8080")
+print("\n💡 现在去 Spark UI 找 task duration 分布:")
+print("   1. http://localhost:8080 → 点最新 App(STAGE06-数据倾斜)")
+print("   2. 上方菜单切到 'SQL / DataFrame' 标签")
+print("   3. 找最新一条 query → 点 Description")
+print("   4. 找到 'Exchange' 节点对应的 Stage,点击 Stage ID")
+print("   5. 在 Stage 详情页找 'Summary Metrics for Tasks' 表格")
+print("   6. 重点看 'Duration' 行的:")
+print("      - Min / 25th percentile / Median / 75th percentile / Max")
+print("   7. 倾斜的标志:Max ≫ Median(可能 10-200x)")
+print("\n   把你看到的 Duration 5 个数(Min/25th/Median/75th/Max)记下来")
 ```
 
-**预期发现** + **手动记录**:
-- Spark UI 上 200 个 task,**Max Duration ≈ Median × 10-100x**(严重倾斜)
-- 整个 Stage 的耗时 ≈ 最长 task 的时间
-- 记下你看到的 `Min / 25% / Median / 75% / Max` 5 个数(对比下面 B/C 用)
+```
+============================================================
+  实验 #9-A: 朴素 GroupBy(关闭 AQE,让倾斜暴露)
+============================================================
+
+耗时: 2.44s
+
+>>> 结果(应该看到 132 占绝对主导)
+  pu_id=132, cnt=2,597,189, revenue=$ 71,696,950.90
+  pu_id=237, cnt=   13,910, revenue=$    273,725.87
+  pu_id=161, cnt=   13,853, revenue=$    332,154.81
+  pu_id=236, cnt=   13,401, revenue=$    271,867.87
+  pu_id=162, cnt=   10,556, revenue=$    245,756.02
+
+>>> Spark App ID: app-20260521025709-0002
+>>> Spark UI: http://localhost:8080
+
+💡 现在去 Spark UI 找 task duration 分布:
+   1. http://localhost:8080 → 点最新 App(STAGE06-数据倾斜)
+   2. 上方菜单切到 'SQL / DataFrame' 标签
+   3. 找最新一条 query → 点 Description
+   4. 找到 'Exchange' 节点对应的 Stage,点击 Stage ID
+   5. 在 Stage 详情页找 'Summary Metrics for Tasks' 表格
+   6. 重点看 'Duration' 行的:
+      - Min / 25th percentile / Median / 75th percentile / Max
+   7. 倾斜的标志:Max ≫ Median(可能 10-200x)
+
+   把你看到的 Duration 5 个数(Min/25th/Median/75th/Max)记下来
+```
+
+#### 使用程序获取数据
+
+```python
+  import requests
+  import json
+
+  app_id = spark.sparkContext.applicationId
+
+  # 拿所有 stages
+  r = requests.get(f"http://localhost:4040/api/v1/applications/{app_id}/stages")
+  stages = r.json()
+
+  # 找最近完成的 stage(按 submissionTime 排序)
+  finished = [s for s in stages if s.get('status') == 'COMPLETE']
+  latest = sorted(finished, key=lambda s: s.get('submissionTime', ''))[-1]
+  sid, aid = latest['stageId'], latest['attemptId']
+  print(f"分析 Stage {sid}.{aid}: {latest.get('name', 'N/A')}")
+  print(f"  num tasks: {latest['numTasks']}")
+  print(f"  shuffle read: {latest.get('shuffleReadBytes', 0) / 1024 / 1024:.2f} MB")
+  print(f"  shuffle write: {latest.get('shuffleWriteBytes', 0) / 1024 / 1024:.2f} MB")
+
+  # 拿这个 stage 的所有 task 详情
+  r2 = requests.get(f"http://localhost:4040/api/v1/applications/{app_id}/stages/{sid}/{aid}")
+  detail = r2.json()
+  tasks = detail.get('tasks', {})
+
+  if tasks:
+      durations = sorted([t['taskMetrics']['executorRunTime'] for t in tasks.values()])
+      n = len(durations)
+      print(f"\n  📊 Task Duration 分布({n} 个 task)")
+      print(f"     Min:       {durations[0]:>6} ms")
+      print(f"     25th:      {durations[n//4]:>6} ms")
+      print(f"     Median:    {durations[n//2]:>6} ms")
+      print(f"     75th:      {durations[3*n//4]:>6} ms")
+      print(f"     Max:       {durations[-1]:>6} ms")
+      print(f"     Max/Median: {durations[-1] / max(durations[n//2], 1):.1f}x   ← 倾斜核心指标")
+
+      # 看处理数据量分布
+      bytes_read = sorted([t['taskMetrics'].get('shuffleReadMetrics', {}).get('totalBytesRead', 0)
+                            for t in tasks.values()])
+      if bytes_read[-1] > 0:
+          print(f"\n  📊 Shuffle Read 分布")
+          print(f"     Median: {bytes_read[n//2]/1024:.1f} KB")
+          print(f"     Max:    {bytes_read[-1]/1024/1024:.2f} MB   ← 倾斜 task 比其他大 N 倍")
+```
+
+```
+分析 Stage 35.0: collect at /tmp/ipykernel_201/1119311665.py:17
+  num tasks: 119
+  shuffle read: 0.02 MB
+  shuffle write: 0.00 MB
+
+  📊 Task Duration 分布(119 个 task)
+     Min:            0 ms
+     25th:           1 ms
+     Median:         3 ms
+     75th:           5 ms
+     Max:           35 ms
+     Max/Median: 11.7x   ← 倾斜核心指标
+```
+
+
+
+```python
+import requests
+
+app_id = spark.sparkContext.applicationId
+
+# 拿所有 stages
+r = requests.get(f"http://localhost:4040/api/v1/applications/{app_id}/stages")
+stages = r.json()
+
+# 列出最近 6 个 stage 的关键指标(让你看清楚是哪个)
+print(">>> 最近 6 个 Stage 概况(按 stageId 倒序)")
+print(f"{'StageID':>8} {'Status':<10} {'Tasks':>6} {'ShuffleRead(MB)':>16} {'Name'}")
+recent = sorted(stages, key=lambda s: s['stageId'], reverse=True)[:6]
+for s in recent:
+    sr_mb = s.get('shuffleReadBytes', 0) / 1024 / 1024
+    print(f"  {s['stageId']:>6} {s.get('status','N/A'):<10} {s.get('numTasks','?'):>6} {sr_mb:>14.2f}   {s.get('name','N/A')[:50]}")
+
+# 找 shuffle read 最大的(那个肯定是倾斜的聚合 stage)
+heavy = max(stages, key=lambda s: s.get('shuffleReadBytes', 0))
+sid, aid = heavy['stageId'], heavy['attemptId']
+print(f"\n>>> 自动选择 ShuffleRead 最大的 Stage {sid}: {heavy.get('name','')[:60]}")
+print(f"     Shuffle Read: {heavy.get('shuffleReadBytes', 0)/1024/1024:.2f} MB")
+print(f"     Tasks: {heavy['numTasks']}")
+
+# 拿这个 stage 的所有 task 详情
+r2 = requests.get(f"http://localhost:4040/api/v1/applications/{app_id}/stages/{sid}/{aid}")
+detail = r2.json()
+tasks = detail.get('tasks', {})
+
+if tasks:
+    durations = sorted([t['taskMetrics']['executorRunTime'] for t in tasks.values()])
+    bytes_read = sorted([t['taskMetrics'].get('shuffleReadMetrics', {}).get('totalBytesRead', 0)
+                          for t in tasks.values()])
+    n = len(durations)
+
+    print(f"\n  📊 Task Duration 分布(共 {n} 个 task)")
+    print(f"     Min:        {durations[0]:>8} ms")
+    print(f"     25th:       {durations[n//4]:>8} ms")
+    print(f"     Median:     {durations[n//2]:>8} ms")
+    print(f"     75th:       {durations[3*n//4]:>8} ms")
+    print(f"     Max:        {durations[-1]:>8} ms")
+    print(f"     Max/Median: {durations[-1] / max(durations[n//2], 1):>8.1f}x   ← 倾斜核心指标")
+
+    if bytes_read[-1] > 0:
+        print(f"\n  📊 Shuffle Read 分布(每个 task 拉了多少数据)")
+        print(f"     Median: {bytes_read[n//2]/1024:>10.1f} KB")
+        print(f"     Max:    {bytes_read[-1]/1024/1024:>10.2f} MB")
+        print(f"     Max/Median 倍数: {bytes_read[-1] / max(bytes_read[n//2], 1):.1f}x")
+        # 多少 task 处于空闲
+        empty = sum(1 for b in bytes_read if b == 0)
+        print(f"     空 Task 数: {empty} / {n} ({empty/n*100:.1f}% 完全没拉到数据)")
+```
+
+```
+>>> 最近 6 个 Stage 概况(按 stageId 倒序)
+ StageID Status      Tasks  ShuffleRead(MB) Name
+      35 COMPLETE      119           0.02   collect at /tmp/ipykernel_201/1119311665.py:17
+      34 COMPLETE      200           0.02   collect at /tmp/ipykernel_201/1119311665.py:17
+      33 SKIPPED         4           0.00   collect at /tmp/ipykernel_201/1119311665.py:17
+      32 COMPLETE      200           0.02   collect at /tmp/ipykernel_201/1119311665.py:17
+      31 COMPLETE        4           0.00   collect at /tmp/ipykernel_201/1119311665.py:17
+      30 COMPLETE        1           0.00   showString at NativeMethodAccessorImpl.java:0
+
+>>> 自动选择 ShuffleRead 最大的 Stage 5: showString at NativeMethodAccessorImpl.java:0
+     Shuffle Read: 0.10 MB
+     Tasks: 1
+
+  📊 Task Duration 分布(共 1 个 task)
+     Min:              53 ms
+     25th:             53 ms
+     Median:           53 ms
+     75th:             53 ms
+     Max:              53 ms
+     Max/Median:      1.0x   ← 倾斜核心指标
+```
+
+
 
 ---
 

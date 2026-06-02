@@ -59,16 +59,17 @@ AQE(运行时反馈优化)
 **理解关键**:RBO 在"编译期"用规则,CBO 在"编译期"用统计,**AQE 在"运行时"用真实数据**。三者协同。
 
 ### 概念 2:谓词下推(Predicate Pushdown)是什么?为什么会失效?
-**生效场景**:`WHERE trip_distance > 5` 上 Parquet 表——Spark 把这个条件**推**到 Parquet 文件读取阶段,跳过整段不满足的 row group,IO 量减少。
+**生效场景**:`WHERE trip_distance > 5` 上 Parquet 表 —— Spark 把这个条件**推**到 Parquet 文件读取阶段,跳过整段不满足的 row group,IO 量减少。
 
 **失效场景**:
+
 - **UDF 包裹**:`WHERE my_udf(trip_distance) > 5` → Spark 不知道 UDF 干啥,只能全读后过滤
 - **CAST 复杂表达式**:`WHERE CAST(distance AS DECIMAL(10,2)) > 5.0` → Spark 3.4+ 部分场景能优化,复杂的还是不行
 - **Like '%xxx'**:前缀不固定,Parquet 的统计信息(min/max)用不上
 
 **业内法则**:**"能用纯 SQL 表达的,绝不用 UDF"**——Catalyst 看不进 UDF,等于关掉了优化器。
 
-### 概念 3:AQE 三大能力
+### 概念 3:AQE 三大能力（动态修改策略，不会在开头直接定死）
 | AQE 能力 | 什么是 | 解决什么痛点 |
 |---------|--------|------------|
 | **动态合并 Shuffle 分区** | 默认 200 分区可能产生很多小 partition,运行时根据真实数据合并到合理大小 | 小分区调度开销大 |
@@ -81,6 +82,7 @@ AQE(运行时反馈优化)
 **CBO** = Cost-Based Optimization,基于"代价"的优化。比如多表 Join,CBO 会算出"先 join A×B 再 join C 比 先 join B×C 再 join A 便宜",自动 reorder。
 
 **前提**:Spark 需要**知道每张表的统计信息**(行数、列基数、min/max)。但 **Spark 默认不自动收集**——你必须运行:
+
 ```sql
 ANALYZE TABLE dwd.fact_trips COMPUTE STATISTICS FOR ALL COLUMNS
 ```
@@ -90,7 +92,7 @@ ANALYZE TABLE dwd.fact_trips COMPUTE STATISTICS FOR ALL COLUMNS
 
 ## 🛠 操作步骤
 
-### 步骤 1:Jupyter 初始化 + 加载 DWD 数据
+### 步骤 1:初始化 + 验证 DWD
 
 ```python
 from pyspark.sql import SparkSession
@@ -104,10 +106,20 @@ spark = SparkSession.builder \
     .enableHiveSupport() \
     .getOrCreate()
 
-# 验证 DWD 表可访问
+# 快速自检
+print(f"Spark: {spark.version}")
 print(f"DWD 行数: {spark.sql('SELECT COUNT(*) FROM dwd.fact_trips').collect()[0][0]:,}")
-print(f"当前 AQE 状态: {spark.conf.get('spark.sql.adaptive.enabled')}")
-print(f"自动广播阈值: {spark.conf.get('spark.sql.autoBroadcastJoinThreshold')}")
+print(f"AQE 默认状态: {spark.conf.get('spark.sql.adaptive.enabled')}")
+print(f"自动广播阈值: {spark.conf.get('spark.sql.autoBroadcastJoinThreshold')} bytes")
+print(f"Shuffle 分区数: {spark.conf.get('spark.sql.shuffle.partitions')}")
+```
+
+```ini
+Spark: 3.4.1
+DWD 行数: 9,227,227
+AQE 默认状态: true
+自动广播阈值: 10485760b bytes
+Shuffle 分区数: 200
 ```
 
 ---
@@ -120,62 +132,112 @@ print(f"自动广播阈值: {spark.conf.get('spark.sql.autoBroadcastJoinThreshol
 ### 实验代码
 
 ```python
-from pyspark.sql.functions import udf
-from pyspark.sql.types import BooleanType
-
 # ── 查询 A: 纯 SQL 谓词(完美下推)─────────
 print("=" * 60)
-print("  A: WHERE trip_distance > 5 (纯 SQL,可下推)")
+print("  实验 #6-A: WHERE trip_distance > 5 (纯 SQL,可下推)")
 print("=" * 60)
+
+# 跑查询计时
 t0 = time.time()
 result_a = spark.sql("""
-    SELECT COUNT(*), SUM(total_amount)
+    SELECT COUNT(*) AS cnt, ROUND(SUM(total_amount), 2) AS total_rev
     FROM dwd.fact_trips
     WHERE trip_distance > 5
 """).collect()
 t_a = time.time() - t0
-print(f"耗时: {t_a:.2f}s")
+
+print(f"\n耗时: {t_a:.2f}s")
+print(f"结果: {result_a[0].asDict()}")
+
+# 看 EXPLAIN — 重点关注 PushedFilters 字段
+print("\n--- 物理计划(重点看 PushedFilters)---")
 spark.sql("""
-    EXPLAIN
+    EXPLAIN FORMATTED
     SELECT COUNT(*), SUM(total_amount)
     FROM dwd.fact_trips
     WHERE trip_distance > 5
 """).show(truncate=False)
+```
 
+```
+============================================================
+  实验 #6-A: WHERE trip_distance > 5 (纯 SQL,可下推)
+============================================================
+
+耗时: 1.07s
+结果: {'cnt': 1475304, 'total_rev': 97020580.4}
+
+--- 物理计划(重点看 PushedFilters)---
++--------------------------------------------------------------------------------------------------------------------------+
+|plan|
++--------------------------------------------------------------------------------------------------------------------------+
+|== Physical Plan ==\nAdaptiveSparkPlan (7)\n+- HashAggregate (6)\n   +- Exchange (5)\n      +- HashAggregate (4)\n         +- Project (3)\n            +- Filter (2)\n               +- Scan parquet spark_catalog.dwd.fact_trips (1)\n\n\n(1) Scan parquet spark_catalog.dwd.fact_trips\nOutput [4]: [trip_distance#123, total_amount#135, year#149, month#150]\nBatched: true\nLocation: CatalogFileIndex [hdfs://namenode:9000/nyc-taxi/dwd/fact_trips]\nPushedFilters: [IsNotNull(trip_distance), GreaterThan(trip_distance,5.0)]\nReadSchema: struct<trip_distance:double,total_amount:double>\n\n(2) Filter\nInput [4]: [trip_distance#123, total_amount#135, year#149, month#150]\nCondition : (isnotnull(trip_distance#123) AND (trip_distance#123 > 5.0))\n\n(3) Project\nOutput [1]: [total_amount#135]\nInput [4]: [trip_distance#123, total_amount#135, year#149, month#150]\n\n(4) HashAggregate\nInput [1]: [total_amount#135]\nKeys: []\nFunctions [2]: [partial_count(1), partial_sum(total_amount#135)]\nAggregate Attributes [2]: [count#154L, sum#155]\nResults [2]: [count#156L, sum#157]\n\n(5) Exchange\nInput [2]: [count#156L, sum#157]\nArguments: SinglePartition, ENSURE_REQUIREMENTS, [plan_id=114]\n\n(6) HashAggregate\nInput [2]: [count#156L, sum#157]\nKeys: []\nFunctions [2]: [count(1), sum(total_amount#135)]\nAggregate Attributes [2]: [count(1)#118L, sum(total_amount#135)#151]\nResults [2]: [count(1)#118L AS count(1)#152L, sum(total_amount#135)#151 AS sum(total_amount)#153]\n\n(7) AdaptiveSparkPlan\nOutput [2]: [count(1)#152L, sum(total_amount)#153]\nArguments: isFinalPlan=false\n\n|
++--------------------------------------------------------------------------------------------------------------------------+
+```
+
+```python
 # ── 查询 B: UDF 包裹谓词(下推失效!)──────
-print("\n" + "=" * 60)
-print("  B: WHERE my_udf(trip_distance) (UDF 包裹,无法下推)")
+print("=" * 60)
+print("  实验 #6-B: WHERE is_long_trip(trip_distance) (UDF 包裹)")
 print("=" * 60)
 
+# 注册一个 UDF — 干的事其实跟 trip_distance > 5 一样
 @udf(returnType=BooleanType())
 def is_long_trip(distance):
     return distance is not None and distance > 5
 
 spark.udf.register("is_long_trip", is_long_trip)
 
+# 跑查询计时
 t0 = time.time()
 result_b = spark.sql("""
-    SELECT COUNT(*), SUM(total_amount)
+    SELECT COUNT(*) AS cnt, ROUND(SUM(total_amount), 2) AS total_rev
     FROM dwd.fact_trips
     WHERE is_long_trip(trip_distance)
 """).collect()
 t_b = time.time() - t0
-print(f"耗时: {t_b:.2f}s")
+
+print(f"\n耗时: {t_b:.2f}s")
+print(f"结果: {result_b[0].asDict()}")
+
+# 看 EXPLAIN — 重点对比 PushedFilters 变化
+print("\n--- 物理计划(重点看 PushedFilters)---")
 spark.sql("""
-    EXPLAIN
+    EXPLAIN FORMATTED
     SELECT COUNT(*), SUM(total_amount)
     FROM dwd.fact_trips
     WHERE is_long_trip(trip_distance)
 """).show(truncate=False)
 
-# ── 汇总 ──────────────────────────────────
+# ── 汇总对比 ──────────────────────────────
 print("\n" + "=" * 60)
-print(f"  A 纯 SQL:  {t_a:.2f}s")
-print(f"  B UDF:    {t_b:.2f}s")
-print(f"  UDF 拖慢比: {t_b/t_a:.2f}x")
-print("\n💡 重点对比 EXPLAIN 输出里的 'PushedFilters' 字段:")
-print("   A 应该有 PushedFilters: [GreaterThan(trip_distance,5)]")
-print("   B 应该 PushedFilters: [] (空!)")
+print(f"  A 纯 SQL:  耗时 1.07s, 结果 cnt=1475304, rev=$97,020,580")
+print(f"  B UDF:     耗时 {t_b:.2f}s, 结果 cnt={result_b[0]['cnt']:,}, rev=${result_b[0]['total_rev']:,.0f}")
+print(f"  UDF 拖慢比: {t_b/1.07:.2f}x")
+print("=" * 60)
+```
+
+```
+============================================================
+  实验 #6-B: WHERE is_long_trip(trip_distance) (UDF 包裹)
+============================================================
+
+耗时: 2.82s
+结果: {'cnt': 1475304, 'total_rev': 97020580.4}
+
+--- 物理计划(重点看 PushedFilters)---
++--------------------------------------------------------------------------------------------------------------------------+
+|plan|
++--------------------------------------------------------------------------------------------------------------------------+
+|== Physical Plan ==\nAdaptiveSparkPlan (9)\n+- HashAggregate (8)\n   +- Exchange (7)\n      +- HashAggregate (6)\n         +- Project (5)\n            +- Filter (4)\n               +- BatchEvalPython (3)\n                  +- Project (2)\n                     +- Scan parquet spark_catalog.dwd.fact_trips (1)\n\n\n(1) Scan parquet spark_catalog.dwd.fact_trips\nOutput [4]: [trip_distance#219, total_amount#231, year#245, month#246]\nBatched: true\nLocation: CatalogFileIndex [hdfs://namenode:9000/nyc-taxi/dwd/fact_trips]\nReadSchema: struct<trip_distance:double,total_amount:double>\n\n(2) Project\nOutput [2]: [trip_distance#219, total_amount#231]\nInput [4]: [trip_distance#219, total_amount#231, year#245, month#246]\n\n(3) BatchEvalPython\nInput [2]: [trip_distance#219, total_amount#231]\nArguments: [is_long_trip(trip_distance#219)#247], [pythonUDF0#251]\n\n(4) Filter\nInput [3]: [trip_distance#219, total_amount#231, pythonUDF0#251]\nCondition : pythonUDF0#251\n\n(5) Project\nOutput [1]: [total_amount#231]\nInput [3]: [trip_distance#219, total_amount#231, pythonUDF0#251]\n\n(6) HashAggregate\nInput [1]: [total_amount#231]\nKeys: []\nFunctions [2]: [partial_count(1), partial_sum(total_amount#231)]\nAggregate Attributes [2]: [count#252L, sum#253]\nResults [2]: [count#254L, sum#255]\n\n(7) Exchange\nInput [2]: [count#254L, sum#255]\nArguments: SinglePartition, ENSURE_REQUIREMENTS, [plan_id=229]\n\n(8) HashAggregate\nInput [2]: [count#254L, sum#255]\nKeys: []\nFunctions [2]: [count(1), sum(total_amount#231)]\nAggregate Attributes [2]: [count(1)#214L, sum(total_amount#231)#249]\nResults [2]: [count(1)#214L AS count(1)#248L, sum(total_amount#231)#249 AS sum(total_amount)#250]\n\n(9) AdaptiveSparkPlan\nOutput [2]: [count(1)#248L, sum(total_amount)#250]\nArguments: isFinalPlan=false\n\n|
++--------------------------------------------------------------------------------------------------------------------------+
+
+
+============================================================
+  A 纯 SQL:  耗时 1.07s, 结果 cnt=1475304, rev=$97,020,580
+  B UDF:     耗时 2.82s, 结果 cnt=1,475,304, rev=$97,020,580
+  UDF 拖慢比: 2.63x
+============================================================
 ```
 
 ### 📊 实测结果(2026-05-17,dwd.fact_trips 9.23M 行)
@@ -376,17 +438,20 @@ avg_col_len=8 / max_col_len=8
 ## 🎤 面试可能被问到的问题
 
 1. **Q: 谓词下推具体是怎么实现的?** 
-   A: 三层协作——SQL Parser 把 WHERE 提出来 → Catalyst 在逻辑计划阶段把 Filter 节点尽量推到 Scan 节点之上 → Parquet 数据源接到 `pushedFilters` 后,用文件 footer 的 row group 统计信息(min/max/null_count)跳过整段。可以用 `df.explain(True)` 看 `PushedFilters` 字段验证。
-
+   A: 三层协作——SQL Parser 把 WHERE 提出来 → Catalyst 在逻辑计划阶段把 **Filter 节点尽量推到 Scan 节点之上** → Parquet 数据源接到 `pushedFilters` 后,用文件 footer 的 row group 统计信息(min/max/null_count)跳过整段。可以用 `df.explain(True)` 看 `PushedFilters` 字段验证。
 2. **Q: 为什么 UDF 会破坏谓词下推?** 
    A: UDF 对 Catalyst 来说是黑盒,优化器**不知道它的输入输出关系**,无法转换为 Parquet 可识别的过滤表达式。修复方案:(1) 改写为纯 SQL/内置函数;(2) 用 Pandas UDF + Arrow 减少 Python 开销;(3) 实在不能改的话,把 UDF 谓词放到 SQL 谓词之后,让 SQL 谓词先过滤再跑 UDF。
-
 3. **Q: AQE 默认开启,为什么生产环境有时还会关?** 
-   A: 三个情况:(1) 已有大量"调优过的代码"依赖固定分区数,AQE 改了分区数导致后续操作出 bug;(2) 某些 streaming 场景 AQE 支持不全;(3) 调试期为了得到可重现的执行计划,临时关掉 AQE。
-
+   A: 三个情况:
+   (1) 已有大量"调优过的代码"依赖固定分区数,AQE 改了分区数导致后续操作出 bug;
+   (2) 某些 streaming 场景 AQE 支持不全;
+   (3) 调试期为了得到可重现的执行计划,临时关掉 AQE。
+   
 4. **Q: CBO 为什么很少人用?** 
-   A: 三个原因:(1) 必须先跑 `ANALYZE TABLE`,很多团队没纳入 ETL 流程;(2) 统计信息会**过期**——大表写入后没重新 ANALYZE,CBO 用旧数据反而误判;(3) 简单查询用不上,只在 5+ 表 Join 场景才显著。生产实践通常**每天凌晨重新 ANALYZE 一次**关键大表。
-
+   A: 三个原因:
+   (1) 必须先跑 `ANALYZE TABLE`,很多团队没纳入 ETL 流程;
+   (2) 统计信息会**过期**——大表写入后没重新 ANALYZE,CBO 用旧数据反而误判;
+   (3) 简单查询用不上,只在 5+ 表 Join 场景才显著。生产实践通常**每天凌晨重新 ANALYZE 一次**关键大表。
 5. **Q: AQE 和 CBO 有什么区别?** 
    A: 时机不同——CBO 是**编译期**用预先收集的统计估算代价;AQE 是**运行时**根据真实执行数据调整。两者互补:CBO 给个好的起点,AQE 在过程中修正。
 
@@ -405,16 +470,3 @@ cd /Users/alen/DA/NYC-Taxi-Trip-analysis/nyc-taxi-platform
 git add docs/ benchmarks/ notebooks/
 git commit -m "feat(stage05): 计算层 3 项实验(谓词下推 + AQE + CBO)"
 ```
-
----
-
-## ➡️ 下一阶段预告
-
-STAGE 06 **数据倾斜实战**(本项目最硬核的一章):
-- 故意制造倾斜场景(给某个 PULocationID 注入 100 万倍数据)
-- 看 Spark UI 的 Stage 详情里 task 时间分布(99% task 1 秒,1% task 5 分钟)
-- 加盐法(salting)手动解决倾斜
-- 对比 AQE Skew Join 自动处理效果
-- **实验 #9**: 倾斜处理前后 task 时间分布对比
-
-需要本阶段产出:`dwd.fact_trips` + 对 AQE/CBO 工具的熟悉度。
