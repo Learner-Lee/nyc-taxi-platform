@@ -49,6 +49,10 @@ docker compose -f docker/docker-compose.core.yml ps postgres
 
 **ADS 层的本质**:把数仓的最终结果**物化到 OLTP**,让前端应用直查——**这就是数仓最后一公里**。
 
+![image-20260603170234307](STAGE_08_ADS层与PG索引.assets/image-20260603170234307.png)
+
+![image-20260603170635445](STAGE_08_ADS层与PG索引.assets/image-20260603170635445.png)
+
 ### 概念 2:PostgreSQL 4 类索引(本阶段全覆盖)
 | 类型 | 写法 | 适用 |
 |------|------|------|
@@ -63,6 +67,7 @@ docker compose -f docker/docker-compose.core.yml ps postgres
 **覆盖索引**:把 SELECT 用到的列都"塞"进索引(INCLUDE),数据库**只读索引就拿到全部数据**,跳过回表——**Index Only Scan**。
 
 **业务类比**:
+
 - 普通索引 = 图书馆的"作者→书架"索引,知道作者后还要去书架找书
 - 覆盖索引 = 索引里直接写了"作者→书名+摘要",不用去书架了
 

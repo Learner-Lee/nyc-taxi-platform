@@ -195,6 +195,8 @@ cnt = int(ch_query("SELECT COUNT(*) FROM nyc.trips").strip())
 print(f"✅ ClickHouse nyc.trips 行数: {cnt:,} (对照 DWD 9,227,227)")
 ```
 
+![image-20260603181656530](STAGE_09_ClickHouse冷热分层.assets/image-20260603181656530.png)
+
 **实测**:导出 ~24s,下载 211.7 MB,导入 10.8s,行数 9,227,227 ✅
 
 ---
@@ -260,6 +262,60 @@ print(f"  ClickHouse 快 {t_spark/t_ch:.1f}x")
 print("=" * 60)
 ```
 
+```
+============================================================
+  A: Spark SQL
+============================================================
+  3 次耗时: ['4.34s', '2.77s', '1.81s']
+  最快: 1.805s
+
+============================================================
+  B: ClickHouse
+============================================================
+  3 次耗时: ['0.524s', '0.248s', '0.187s']
+  最快: 0.187s
+
+============================================================
+  Spark SQL:  1.805s
+  ClickHouse: 0.187s
+  🚀 ClickHouse 快 9.6x
+============================================================
+
+>>> ClickHouse 聚合结果:
+Manhattan	day	3208747	74674486	2.32
+Manhattan	night	2456869	56322318.45	2.57
+Manhattan	evening_rush	1723856	40271094.87	2.13
+Queens	day	299566	22061246.81	12.46
+Manhattan	morning_rush	907311	20067921.32	2.37
+Queens	night	265133	18659974.14	12.97
+Queens	evening_rush	152188	11489919.39	12.91
+Queens	morning_rush	73334	5098102.51	12.17
+Brooklyn	night	29934	941593.36	5.63
+Brooklyn	day	28247	926764.65	6.16
+Brooklyn	morning_rush	17333	605642.61	6.7
+Brooklyn	evening_rush	11765	358067.15	4.92
+Unknown	day	11344	318192.28	3.32
+Bronx	day	8472	300118.98	7.81
+Unknown	night	8681	247181.37	3.7
+Bronx	morning_rush	5677	198310.52	7.36
+Bronx	night	5109	181627.42	7.8
+Unknown	evening_rush	5636	157125.95	3.13
+Unknown	morning_rush	3596	97759.15	3.39
+Bronx	evening_rush	1913	64602.61	7.05
+N/A	day	821	64143.21	9.44
+N/A	night	748	57647.77	8.43
+N/A	evening_rush	326	25886.99	8.66
+N/A	morning_rush	260	15518.51	9.16
+EWR	day	98	9503.99	5.49
+Staten Island	night	87	4959.27	11.52
+EWR	evening_rush	44	3829.12	6.88
+EWR	night	30	3106.23	7.56
+Staten Island	day	66	2617.51	7.62
+EWR	morning_rush	10	1170.72	6.4
+Staten Island	morning_rush	18	1017.06	12.31
+Staten Island	evening_rush	8	277.25	6.64
+```
+
 **预期看到**:ClickHouse 比 Spark SQL 快 **10-50x**(Spark 启动 Job 的开销 + ClickHouse 列式向量化的优势叠加)。
 
 ---
@@ -302,17 +358,17 @@ print("\n💡 minmax 索引让 ClickHouse 跳过 PULocationID 不在 [130,140] �
 ## 🎤 面试可能被问到的问题
 
 1. **Q: ClickHouse 为什么比 Spark 快这么多?**
-   A: 三个层面——(1) **无启动开销**:Spark 每个 Job 要起 JVM + 调度,几百 ms;CH 是常驻 C++ 进程;(2) **向量化执行**:CH 用 SIMD 批量处理,Spark 虽然也有 codegen 但 JVM 有损耗;(3) **存储即索引**:CH MergeTree 数据按 ORDER BY 物理排序,聚合时数据局部性极好。**但 CH 不适合复杂 Join 和 ETL,各有所长**。
-
+   A: 三个层面 —— 
+   (1) **无启动开销**:Spark 每个 Job 要起 JVM + 调度,几百 ms;CH 是常驻 C++ 进程;
+   (2) **向量化执行**:CH 用 SIMD 批量处理,Spark 虽然也有 codegen 但 JVM 有损耗;
+   (3) **存储即索引**:CH MergeTree 数据按 ORDER BY 物理排序,聚合时数据局部性极好。**但 CH 不适合复杂 Join 和 ETL,各有所长**。
+   
 2. **Q: MergeTree 的 ORDER BY 和 PostgreSQL 的主键有什么区别?**
    A: CH 的 ORDER BY **不要求唯一**(可以有重复),它的作用是"物理排序 + 稀疏索引"。PG 主键要求唯一 + 自动建 B-Tree。CH 没有"主键约束"概念,ORDER BY 纯粹为查询性能服务。
-
 3. **Q: 跳数索引和 B-Tree 索引的区别?**
    A: B-Tree **定位到行**(找到具体哪一行);跳数索引**定位到块**(跳过不需要扫的数据块,块内还要扫)。跳数索引空间极小、维护成本低,但精度粗。**CH 用跳数索引是因为它的查询模式是"扫一片"而非"找一行"**。
-
 4. **Q: 冷热分层怎么设计?数据怎么从热变冷?**
    A: 按访问频率分层——热数据(ClickHouse)、温数据(Parquet)、冷数据(对象存储)。**迁移用 TTL 策略**:CH 支持 `TTL pickup_date + INTERVAL 3 MONTH TO DISK 'cold'`,自动把过期数据移到便宜存储。生产用 Airflow 定时把 CH 的旧数据导出到 Parquet/S3。
-
 5. **Q: 什么数据该放 ClickHouse,什么该放 PostgreSQL?**
    A: ClickHouse——大数据量聚合、看板、时序分析(写多读多,不要事务);PostgreSQL——点查、事务、高并发 OLTP(司机端 App、订单状态)。**本项目就是这么分的:运营看板走 CH,司机端走 PG**。
 
@@ -358,13 +414,3 @@ git commit -m "feat(stage09): ClickHouse 冷热分层 + CH vs Spark 对比"
 
 ---
 
-## ➡️ 下一阶段预告
-
-STAGE 10 **Airflow 调度编排**:
-- 启动 serving 组的 Airflow
-- 把 ODS→DWD→DWS→ADS 的 ETL 串成 DAG
-- 配置失败重试 + 任务依赖
-- **理解幂等性**:任务重跑不产生重复数据
-- 把"手动跑 Notebook"升级为"自动化 Pipeline"
-
-需要本阶段产出:稳定的各层数据 + ClickHouse 表。**STAGE 10 需要启动 Airflow(再吃 2GB 内存)**。

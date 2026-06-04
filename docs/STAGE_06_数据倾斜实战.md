@@ -251,7 +251,9 @@ spark.sql("""
 ## 🔬 实验 #9: 倾斜处理三阶段对比(本阶段核心)
 
 ### 实验目的
+
 对**同一个 GROUP BY pu_id** 查询,跑三种方式,**对比最长 task 时间和 stage 总耗时**:
+
 - **A 朴素 GroupBy**(不处理倾斜)
 - **B 加盐法**(手动两阶段聚合)
 - **C AQE 自动**(开启 AQE 让 Spark 自己解决)
@@ -260,10 +262,9 @@ spark.sql("""
 
 ```python
 print("=" * 60)
-print("  实验 #9-A: 朴素 GroupBy(关闭 AQE,让倾斜暴露)")
+print("  A: 朴素 GroupBy(关闭 AQE 突出倾斜)")
 print("=" * 60)
-
-# 关闭 AQE,使倾斜不被自动处理
+# 关闭 AQE,让倾斜暴露
 spark.conf.set("spark.sql.adaptive.enabled", "false")
 spark.conf.set("spark.sql.shuffle.partitions", "200")
 
@@ -278,99 +279,13 @@ result_a = spark.sql("""
 """).collect()
 t_a = time.time() - t0
 
-print(f"\n耗时: {t_a:.2f}s")
-print(f"\n>>> 结果(应该看到 132 占绝对主导)")
-for r in result_a[:5]:
-    print(f"  pu_id={r['pu_id']}, cnt={r['cnt']:>9,}, revenue=${r['revenue']:>14,.2f}")
-
-print(f"\n>>> Spark App ID: {spark.sparkContext.applicationId}")
-print(f">>> Spark UI: http://localhost:8080")
-print("\n💡 现在去 Spark UI 找 task duration 分布:")
-print("   1. http://localhost:8080 → 点最新 App(STAGE06-数据倾斜)")
-print("   2. 上方菜单切到 'SQL / DataFrame' 标签")
-print("   3. 找最新一条 query → 点 Description")
-print("   4. 找到 'Exchange' 节点对应的 Stage,点击 Stage ID")
-print("   5. 在 Stage 详情页找 'Summary Metrics for Tasks' 表格")
-print("   6. 重点看 'Duration' 行的:")
-print("      - Min / 25th percentile / Median / 75th percentile / Max")
-print("   7. 倾斜的标志:Max ≫ Median(可能 10-200x)")
-print("\n   把你看到的 Duration 5 个数(Min/25th/Median/75th/Max)记下来")
-```
-
-```
-============================================================
-  实验 #9-A: 朴素 GroupBy(关闭 AQE,让倾斜暴露)
-============================================================
-
-耗时: 2.44s
-
->>> 结果(应该看到 132 占绝对主导)
-  pu_id=132, cnt=2,597,189, revenue=$ 71,696,950.90
-  pu_id=237, cnt=   13,910, revenue=$    273,725.87
-  pu_id=161, cnt=   13,853, revenue=$    332,154.81
-  pu_id=236, cnt=   13,401, revenue=$    271,867.87
-  pu_id=162, cnt=   10,556, revenue=$    245,756.02
-
->>> Spark App ID: app-20260521025709-0002
->>> Spark UI: http://localhost:8080
-
-💡 现在去 Spark UI 找 task duration 分布:
-   1. http://localhost:8080 → 点最新 App(STAGE06-数据倾斜)
-   2. 上方菜单切到 'SQL / DataFrame' 标签
-   3. 找最新一条 query → 点 Description
-   4. 找到 'Exchange' 节点对应的 Stage,点击 Stage ID
-   5. 在 Stage 详情页找 'Summary Metrics for Tasks' 表格
-   6. 重点看 'Duration' 行的:
-      - Min / 25th percentile / Median / 75th percentile / Max
-   7. 倾斜的标志:Max ≫ Median(可能 10-200x)
-
-   把你看到的 Duration 5 个数(Min/25th/Median/75th/Max)记下来
-```
-
-#### 使用程序获取数据
-
-```python
-  import requests
-  import json
-
-  app_id = spark.sparkContext.applicationId
-
-  # 拿所有 stages
-  r = requests.get(f"http://localhost:4040/api/v1/applications/{app_id}/stages")
-  stages = r.json()
-
-  # 找最近完成的 stage(按 submissionTime 排序)
-  finished = [s for s in stages if s.get('status') == 'COMPLETE']
-  latest = sorted(finished, key=lambda s: s.get('submissionTime', ''))[-1]
-  sid, aid = latest['stageId'], latest['attemptId']
-  print(f"分析 Stage {sid}.{aid}: {latest.get('name', 'N/A')}")
-  print(f"  num tasks: {latest['numTasks']}")
-  print(f"  shuffle read: {latest.get('shuffleReadBytes', 0) / 1024 / 1024:.2f} MB")
-  print(f"  shuffle write: {latest.get('shuffleWriteBytes', 0) / 1024 / 1024:.2f} MB")
-
-  # 拿这个 stage 的所有 task 详情
-  r2 = requests.get(f"http://localhost:4040/api/v1/applications/{app_id}/stages/{sid}/{aid}")
-  detail = r2.json()
-  tasks = detail.get('tasks', {})
-
-  if tasks:
-      durations = sorted([t['taskMetrics']['executorRunTime'] for t in tasks.values()])
-      n = len(durations)
-      print(f"\n  📊 Task Duration 分布({n} 个 task)")
-      print(f"     Min:       {durations[0]:>6} ms")
-      print(f"     25th:      {durations[n//4]:>6} ms")
-      print(f"     Median:    {durations[n//2]:>6} ms")
-      print(f"     75th:      {durations[3*n//4]:>6} ms")
-      print(f"     Max:       {durations[-1]:>6} ms")
-      print(f"     Max/Median: {durations[-1] / max(durations[n//2], 1):.1f}x   ← 倾斜核心指标")
-
-      # 看处理数据量分布
-      bytes_read = sorted([t['taskMetrics'].get('shuffleReadMetrics', {}).get('totalBytesRead', 0)
-                            for t in tasks.values()])
-      if bytes_read[-1] > 0:
-          print(f"\n  📊 Shuffle Read 分布")
-          print(f"     Median: {bytes_read[n//2]/1024:.1f} KB")
-          print(f"     Max:    {bytes_read[-1]/1024/1024:.2f} MB   ← 倾斜 task 比其他大 N 倍")
+print(f"耗时: {t_a:.2f}s")
+print(f"App ID: {spark.sparkContext.applicationId}")
+print("\n>>> 🔍 打开 Spark UI: http://localhost:8080")
+print("   1. 点最近 Application → SQL 标签 → 找这条 query")
+print("   2. 看 Stage 详情里的 'Summary Metrics for Tasks'")
+print("   3. 重点看 'Duration' 行的 Min / Median / Max")
+print("   4. 倾斜的标志:Max 远大于 Median(可能 10-100x)")
 ```
 
 ```
@@ -388,87 +303,13 @@ print("\n   把你看到的 Duration 5 个数(Min/25th/Median/75th/Max)记下来
      Max/Median: 11.7x   ← 倾斜核心指标
 ```
 
+**预期发现** + **手动记录**:
+
+- Spark UI 上 200 个 task,**Max Duration ≈ Median × 10-100x**(严重倾斜)
+- 整个 Stage 的耗时 ≈ 最长 task 的时间
+- 记下你看到的 `Min / 25% / Median / 75% / Max` 5 个数(对比下面 B/C 用)
 
 
-```python
-import requests
-
-app_id = spark.sparkContext.applicationId
-
-# 拿所有 stages
-r = requests.get(f"http://localhost:4040/api/v1/applications/{app_id}/stages")
-stages = r.json()
-
-# 列出最近 6 个 stage 的关键指标(让你看清楚是哪个)
-print(">>> 最近 6 个 Stage 概况(按 stageId 倒序)")
-print(f"{'StageID':>8} {'Status':<10} {'Tasks':>6} {'ShuffleRead(MB)':>16} {'Name'}")
-recent = sorted(stages, key=lambda s: s['stageId'], reverse=True)[:6]
-for s in recent:
-    sr_mb = s.get('shuffleReadBytes', 0) / 1024 / 1024
-    print(f"  {s['stageId']:>6} {s.get('status','N/A'):<10} {s.get('numTasks','?'):>6} {sr_mb:>14.2f}   {s.get('name','N/A')[:50]}")
-
-# 找 shuffle read 最大的(那个肯定是倾斜的聚合 stage)
-heavy = max(stages, key=lambda s: s.get('shuffleReadBytes', 0))
-sid, aid = heavy['stageId'], heavy['attemptId']
-print(f"\n>>> 自动选择 ShuffleRead 最大的 Stage {sid}: {heavy.get('name','')[:60]}")
-print(f"     Shuffle Read: {heavy.get('shuffleReadBytes', 0)/1024/1024:.2f} MB")
-print(f"     Tasks: {heavy['numTasks']}")
-
-# 拿这个 stage 的所有 task 详情
-r2 = requests.get(f"http://localhost:4040/api/v1/applications/{app_id}/stages/{sid}/{aid}")
-detail = r2.json()
-tasks = detail.get('tasks', {})
-
-if tasks:
-    durations = sorted([t['taskMetrics']['executorRunTime'] for t in tasks.values()])
-    bytes_read = sorted([t['taskMetrics'].get('shuffleReadMetrics', {}).get('totalBytesRead', 0)
-                          for t in tasks.values()])
-    n = len(durations)
-
-    print(f"\n  📊 Task Duration 分布(共 {n} 个 task)")
-    print(f"     Min:        {durations[0]:>8} ms")
-    print(f"     25th:       {durations[n//4]:>8} ms")
-    print(f"     Median:     {durations[n//2]:>8} ms")
-    print(f"     75th:       {durations[3*n//4]:>8} ms")
-    print(f"     Max:        {durations[-1]:>8} ms")
-    print(f"     Max/Median: {durations[-1] / max(durations[n//2], 1):>8.1f}x   ← 倾斜核心指标")
-
-    if bytes_read[-1] > 0:
-        print(f"\n  📊 Shuffle Read 分布(每个 task 拉了多少数据)")
-        print(f"     Median: {bytes_read[n//2]/1024:>10.1f} KB")
-        print(f"     Max:    {bytes_read[-1]/1024/1024:>10.2f} MB")
-        print(f"     Max/Median 倍数: {bytes_read[-1] / max(bytes_read[n//2], 1):.1f}x")
-        # 多少 task 处于空闲
-        empty = sum(1 for b in bytes_read if b == 0)
-        print(f"     空 Task 数: {empty} / {n} ({empty/n*100:.1f}% 完全没拉到数据)")
-```
-
-```
->>> 最近 6 个 Stage 概况(按 stageId 倒序)
- StageID Status      Tasks  ShuffleRead(MB) Name
-      35 COMPLETE      119           0.02   collect at /tmp/ipykernel_201/1119311665.py:17
-      34 COMPLETE      200           0.02   collect at /tmp/ipykernel_201/1119311665.py:17
-      33 SKIPPED         4           0.00   collect at /tmp/ipykernel_201/1119311665.py:17
-      32 COMPLETE      200           0.02   collect at /tmp/ipykernel_201/1119311665.py:17
-      31 COMPLETE        4           0.00   collect at /tmp/ipykernel_201/1119311665.py:17
-      30 COMPLETE        1           0.00   showString at NativeMethodAccessorImpl.java:0
-
->>> 自动选择 ShuffleRead 最大的 Stage 5: showString at NativeMethodAccessorImpl.java:0
-     Shuffle Read: 0.10 MB
-     Tasks: 1
-
-  📊 Task Duration 分布(共 1 个 task)
-     Min:              53 ms
-     25th:             53 ms
-     Median:           53 ms
-     75th:             53 ms
-     Max:              53 ms
-     Max/Median:      1.0x   ← 倾斜核心指标
-```
-
-
-
----
 
 ### Cell B: 加盐法(手动两阶段聚合)
 
@@ -516,7 +357,70 @@ for r in result_b[:5]:
     print(f"  pu_id={r['pu_id']}, cnt={r['cnt']:,}, revenue={r['revenue']:,}")
 ```
 
+##### 问题根源:为什么 132 需要加盐
+
+在 `GROUP BY pu_id` 时,Spark 按 key 的 hash 决定每行去哪个 shuffle partition。`pu_id = 132` 是热 key——它的行数远超其他 pu_id。所有 132 的行 hash 值相同,必然落到**同一个 partition**,由**同一个 task** 处理。结果就是你在实验 A 里看到的:其他 task 几毫秒跑完,这个 task 单独扛着(Max/Median = 11.7x)。整个 stage 的耗时 ≈ 这一个最慢 task 的耗时。
+
+##### 阶段 1:加盐(把 1 个热 key 拆成 16 份)
+
+关键就是这段 `CASE`:
+
+```sql
+CASE WHEN pu_id = 132
+     THEN CONCAT(pu_id, '_', CAST(FLOOR(rand() * 16) AS STRING))
+     ELSE CAST(pu_id AS STRING)
+END AS salted_key
+```
+
+逐层看 `FLOOR(rand() * 16)`:`rand()` 给出 `[0, 1)` 的随机浮点 → 乘 16 变成 `[0, 16)` → `FLOOR` 取整成 `0~15` 的整数 → 拼到 pu_id 后面。于是 132 的每一行,会随机变成 `132_0`、`132_1`、……、`132_15` 中的一个,大致均匀分到 16 个桶里。
+
+非热 key 走 `ELSE` 分支,原样保留(只是转成字符串),**不浪费**额外开销去拆它们。
+
+这样一来,132 从"1 个 group"变成了"16 个 group",hash 后可以落到最多 16 个 partition,由最多 16 个 task 并行处理。每个 task 只需要扛热 key 大约 1/16 的数据,最慢 task 的工作量直接砍到原来的 ~1/16。
+
+##### 为什么 `GROUP BY` 要同时带上 salted_key 和 pu_id
+
+```sql
+GROUP BY salted_key, pu_id
+```
+
+- `salted_key` 是**真正控制数据分散**的那一列(它决定行落到哪个 partition)。
+- `pu_id` 是为了**把原始身份直接带到下一阶段**。这样阶段 2 只需 `GROUP BY pu_id` 就能合并,不用再去解析 `132_0` 把盐字符串切回来。
+
+注意加上 pu_id 不会改变分组粒度:对非热 key,`salted_key` 本来就等于 pu_id;对热 key,每个桶内 pu_id 恒为 132。所以 pu_id 是"免费搭车"过去的。
+
+##### 阶段 2:去盐(把 16 份合回 1 份)
+
+```sql
+SELECT pu_id,
+       SUM(partial_cnt) AS cnt,
+       SUM(partial_rev) AS revenue
+FROM (...) salted
+GROUP BY pu_id
+```
+
+阶段 1 的输出里,132 是 16 行部分结果(每行是 1/16 数据的小计),其他 pu_id 各是 1 行完整结果。阶段 2 按原始 pu_id 再聚合一次:132 的 16 行 `SUM` 回成 1 行;其他 pu_id 的 `SUM` 作用在单行上,等于没动。这一步处理的数据量极小(每个 pu_id 就一行,热 key 多 15 行),所以即使多了一次 shuffle 也很便宜。
+
+下面这张图把整个流转画出来:
+
+下面这张图聚焦热 key 132 的旅程——加盐前它只能进一个 task,加盐后被拆成 16 份并行处理,最后再合回来:
+
+![image-20260602135641903](STAGE_06_数据倾斜实战.assets/image-20260602135641903.png)
+
+##### 为什么 COUNT/SUM 能这样拆——以及它的边界
+
+加盐之所以成立,本质是因为 `COUNT` 和 `SUM` 是**可分解的(decomposable)**:全量的计数 = 各部分计数之和,全量的求和 = 各部分求和之和。所以把数据随机切成 16 份分别算,再加起来,结果和直接算完全一致(这也是 B 单元最后那句"结果应与 A 完全一致"的依据)。
+
+但要注意:不是所有聚合都能这样裸加盐。`COUNT(DISTINCT)`、`MEDIAN`、`PERCENTILE` 这类**不可加性**指标,简单加盐会算错——16 份各自去重后相加,会把跨桶的重复值重复计数。这类场景要么用更复杂的两阶段算法(如 HLL 近似去重),要么换思路。
+
+##### 一句话总结这个权衡
+
+加盐用"多一次 shuffle 的固定成本"换"最慢 task 的耗时大幅下降"。`SALT=16` 是个调参旋钮:盐越多并行度越高、单 task 越轻,但阶段 1 产出的中间行数也越多(热 key 从 1 行变 16 行)、阶段 2 越重。所以盐不是越大越好,要和热 key 的实际倾斜倍数匹配——你实验里 Max/Median ≈ 12x,选 16 是个合理的量级。
+
+跑完 B 之后对比 Spark UI,重点看阶段 1 的 task `Max Duration` 是不是从 35ms 那一档明显掉下来了,以及总耗时是不是因为多一次 shuffle 而略增——这正是 C 单元里 AQE 想自动帮你做的同一件事。
+
 **关键设计点**:
+
 - `SALT = 16`:把热 key 132 拆成 16 份,并行度从 1 → 16
 - **非热 key 不加盐**:节省不必要的两阶段聚合
 - **GROUP BY 同时包含 salted_key 和 pu_id**:确保第一阶段能正确聚合,第二阶段去盐时还能合并
@@ -631,18 +535,21 @@ print(f"\nAQE Skew Join 加速: {t_c_off/t_c_on:.2f}x")
 
 1. **Q: 你怎么发现数据倾斜?**
    A: 三个层次——(1) Spark UI 的 Stage 详情,看 task duration 的 Max/Median 比;>= 5x 通常算倾斜,>= 50x 是严重倾斜。(2) Stage 的"Tasks: Succeeded/Total"长时间卡在差 1-2 个;(3) Spark logs 里会偶尔报 "Long-running task" 警告。
-
 2. **Q: 加盐法为什么要两阶段聚合?**
    A: 一阶段聚合后,加盐的 key 是 `132_0`、`132_1` 等 16 个不同 key,不能直接当 `132` 用。所以阶段 2 要再 GroupBy 一次,**用原始 key**(不是 salted_key)做最终汇总。这是为什么阶段 1 的 GROUP BY 子句必须**同时包含 salted_key 和原始 pu_id**。
-
 3. **Q: AQE Skew Join 这么好用,为什么还要学加盐法?**
    A: 三个原因——(1) AQE Skew Join **只对 Join 生效**,GroupBy 倾斜还得加盐;(2) AQE 阈值 256MB 在某些场景偏大,小数据集倾斜检测不出;(3) 面试官会问"如果不用 AQE 怎么解决",加盐法是兜底方案。
-
 4. **Q: SALT 系数怎么选?16/32/64?**
    A: 经验法则:看**热 key 占总数据的比例 × 总并行度**。比如热 key 占 90% + 总并行度 200,那理论上热 key 拆 0.9×200=180 份效果最好,但 SALT 过大会让阶段 2 聚合变慢。**通常 16-64 是甜蜜点**,可以分别试一下。
-
 5. **Q: 真实生产里你怎么处理"未知倾斜"?**
    A: 三步走——(1) 先开 AQE Skew Join,大部分场景自动解决;(2) 仍有问题就跑 `df.groupBy("key").count().orderBy(desc("count")).show()` 找出热 key;(3) 对热 key 单独 union 处理或者加盐。**核心原则:先让 AQE 兜底,不行再人工干预**。
+   ![image-20260603151825881](STAGE_06_数据倾斜实战.assets/image-20260603151825881.png)
+
+| 场景              | 首选手段                             | 为什么不是 broadcast   |
+| ----------------- | ------------------------------------ | ---------------------- |
+| join,一侧小       | **broadcast**(可配 union 只广播热路) | —— 这就是它的主场      |
+| join,两侧都大     | union 隔离 + 热路**加盐**            | 没有一侧塞得进内存     |
+| group by 单热 key | **加盐**两阶段                       | 聚合没有"另一侧"可广播 |
 
 ---
 
@@ -663,12 +570,112 @@ git commit -m "feat(stage06): 数据倾斜三方案对比(朴素 / 加盐 / AQE)
 
 ---
 
-## ➡️ 下一阶段预告
 
-STAGE 07 **DWS 层与查询优化**:
-- 设计 DWS 层(日/周/月汇总,从 DWD 物化预聚合)
-- 实验 #10: **窗口函数 vs 自连接**——重写"同比增长率"查询,加速 10x+
-- **近似计算**: `approx_count_distinct` (HyperLogLog) vs `COUNT(DISTINCT)`
-- 物化视图:把高频查询的结果预计算落表
 
-需要本阶段产出:稳定的 `dwd.fact_trips` + 对倾斜处理的体感。
+# 附页一：加盐
+
+**Step 0 — 先确认热 key 是谁(不要凭记忆写死 132)**
+
+```python
+spark.sql("""
+    SELECT pu_id, COUNT(*) AS cnt
+    FROM dwd.fact_trips_skewed
+    GROUP BY pu_id
+    ORDER BY cnt DESC
+    LIMIT 5
+""").show()
+```
+
+你会看到:`pu_id=132` 的 cnt 远大于第二名(可能差一两个数量级)。这一步是诊断——加盐是把刀,得先确认割在哪。如果有多个热 key,后面 `CASE` 里就把它们都列进去。
+
+**Step 1 — 只看"加盐"这一个动作,先不聚合**
+
+```python
+SALT = 16
+spark.sql(f"""
+    SELECT
+        pu_id,
+        CASE WHEN pu_id = 132
+             THEN CONCAT(pu_id, '_', CAST(FLOOR(rand() * {SALT}) AS STRING))
+             ELSE CAST(pu_id AS STRING)
+        END AS salted_key
+    FROM dwd.fact_trips_skewed
+    WHERE pu_id IN (132, 1)
+    LIMIT 20
+""").show(truncate=False)
+```
+
+你会看到:`pu_id=132` 的行,`salted_key` 变成 `132_7`、`132_3`、`132_11`…… 每行随机落进 0~15 某个桶;而 `pu_id=1` 的 `salted_key` 还是 `"1"`。这就是加盐的瞬间——**一个热 key 被打散成 16 个 key**。`rand()` 每行独立取值,所以分布大致均匀,这正是我们要的。
+
+**Step 2 — 阶段 1:按加盐后的 key 聚合**
+
+```python
+SALT = 16
+stage1 = spark.sql(f"""
+    SELECT
+        CASE WHEN pu_id = 132
+             THEN CONCAT(pu_id, '_', CAST(FLOOR(rand() * {SALT}) AS STRING))
+             ELSE CAST(pu_id AS STRING)
+        END AS salted_key,
+        pu_id,
+        COUNT(*)          AS partial_cnt,
+        SUM(total_amount) AS partial_rev
+    FROM dwd.fact_trips_skewed
+    GROUP BY 1, 2
+""")
+stage1.createOrReplaceTempView("stage1")
+
+stage1.filter("pu_id = 132").orderBy("salted_key").show()
+```
+
+你会看到:`pu_id=132` 现在变成约 16 行(`132_0`…`132_15`),每行的 `partial_cnt` 大约是总量的 1/16;其他 pu_id 仍是 1 行。
+
+两个细节:这里我用 `GROUP BY 1, 2`(按 SELECT 的第 1、2 列分组),比你原来在两处重复写整段 `CASE` 更稳——能保证 SELECT 和 GROUP BY 用的是**同一个**计算出来的 salted_key,不会因为 `rand()` 被算两次而出岔子。带上第 2 列 `pu_id`,是为了把原始身份直接捎到阶段 2。
+
+**Step 3 — 阶段 2:去盐,把 16 份合回去**
+
+```python
+result_salted = spark.sql("""
+    SELECT
+        pu_id,
+        SUM(partial_cnt)           AS cnt,
+        ROUND(SUM(partial_rev), 2) AS revenue
+    FROM stage1
+    GROUP BY pu_id
+    ORDER BY cnt DESC
+""")
+result_salted.show(5)
+```
+
+你会看到:`pu_id=132` 又变回 1 行,`cnt` 等于完整总数。这一步处理的中间结果极小(每个 key 一行,热 key 多 15 行),所以即使多一次 shuffle 也几乎不花钱。
+
+**Step 4 — 验正确性 + 量效果**
+
+先确认结果和朴素版**完全一致**(这是加盐没写错的硬证据):
+
+```python
+naive = spark.sql("""
+    SELECT pu_id, COUNT(*) AS cnt, ROUND(SUM(total_amount), 2) AS revenue
+    FROM dwd.fact_trips_skewed
+    GROUP BY pu_id
+""")
+
+diff = (naive.alias("a")
+        .join(result_salted.alias("b"), "pu_id", "full_outer")
+        .filter("a.cnt <> b.cnt OR a.revenue <> b.revenue"))
+print("不一致行数:", diff.count())   # 期望 0
+```
+
+再对比耗时(关掉 AQE 公平比较):
+
+```python
+import time
+spark.conf.set("spark.sql.adaptive.enabled", "false")
+
+def timed(name, df):
+    t0 = time.time(); df.collect(); dt = time.time() - t0
+    print(f"{name}: {dt:.2f}s"); return dt
+
+timed("朴素 GroupBy", naive.orderBy("cnt", ascending=False))
+timed("加盐两阶段",   result_salted)
+```

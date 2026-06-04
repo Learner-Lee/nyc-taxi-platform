@@ -3,6 +3,7 @@
 ## 🎯 本阶段目标
 
 - **业务问题**:前 9 个阶段都是**手动在 Jupyter 一个 cell 一个 cell 跑**。真实生产里,ODS→DWD→DWS→ADS 这条链路要**每天凌晨自动跑**,失败要重试要告警。这一阶段用 Airflow 把手动流程升级为**自动化 Pipeline**——这是"数据分析师 → 数据工程师"的关键一跃。
+  ![image-20260603183646239](STAGE_10_Airflow调度编排.assets/image-20260603183646239.png)
 - **技术能力**:
   - 理解 DAG(有向无环图)、Operator、Task 依赖
   - 用 Airflow 编排多层 ETL 任务
